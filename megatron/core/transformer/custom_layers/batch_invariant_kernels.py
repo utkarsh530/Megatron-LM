@@ -206,6 +206,11 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
             "num_stages": 3,
             "num_warps": 8,
         },
+        # PATCH(NRL_BI_MM_CONFIG, Path-B B200 tuning): override the bf16 FIXED config
+        # via env "BM,BN,BK,GROUP,stages,warps". Any fixed (M-independent) config keeps
+        # batch-invariance AND engine<->scoring bitwise agreement (both sides run this
+        # same kernel/config at every M; the k-loop grouping does not depend on M).
+        # Verified per-candidate through the gen_kl harness regardless.
         torch.float16: {
             "BLOCK_SIZE_M": 128,
             "BLOCK_SIZE_N": 256,
@@ -223,6 +228,22 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
             "num_warps": 8,
         },
     }
+    import os as _os_mmcfg
+    _mm_cfg_env = _os_mmcfg.environ.get("NRL_BI_MM_CONFIG", "")
+    if _mm_cfg_env:
+        try:
+            _bm, _bn, _bk, _grp, _stg, _wrp = (int(v) for v in _mm_cfg_env.split(","))
+            configs[torch.bfloat16] = {
+                "BLOCK_SIZE_M": _bm, "BLOCK_SIZE_N": _bn, "BLOCK_SIZE_K": _bk,
+                "GROUP_SIZE_M": _grp, "num_stages": _stg, "num_warps": _wrp,
+            }
+            if not globals().get("_NRL_MM_CFG_BANNER"):
+                globals()["_NRL_MM_CFG_BANNER"] = True
+                import sys as _sys_mm
+                print(f"[NRL_BI_MM_CONFIG] bf16 matmul_persistent config OVERRIDE: {configs[torch.bfloat16]}",
+                      file=_sys_mm.stderr, flush=True)
+        except ValueError:
+            raise RuntimeError(f"NRL_BI_MM_CONFIG malformed (want 'BM,BN,BK,GROUP,stages,warps'): {_mm_cfg_env!r}")
     matmul_kernel_persistent[grid](
         a,
         b,
@@ -478,12 +499,21 @@ def mean_dim(
     return output
 
 
+_NRL_HIT = {}
+def _nrl_hit(tag, shape):
+    if tag not in _NRL_HIT:
+        _NRL_HIT[tag] = True
+        print(f"[NRL_BI_HIT] {tag} first hit, shape={shape}", flush=True)
+
+
 def mm_batch_invariant(a, b):
+    _nrl_hit("aten.mm", tuple(a.shape))
     """Batch-invariant replacement for `aten::mm` using a persistent matmul kernel."""
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
+    _nrl_hit("aten.addmm", tuple(a.shape))
     """Batch-invariant replacement for `aten::addmm` using a persistent matmul kernel."""
     return matmul_persistent(a, b, bias=bias)
 
@@ -545,6 +575,28 @@ def _te_patch_for_batch_invariant():
     import transformer_engine.pytorch as te
     import transformer_engine.pytorch.cpp_extensions as te_cpp
 
+    # PATCH(NRL_TE_WS_BYTES, TE-workspace starve): nightly TE 2.15 hardcodes the
+    # cuBLAS workspace to 32MiB+1024 on sm>=9 in cpp_extensions/gemm.py
+    # get_cublas_workspace_size_bytes() — it reads NO env var, so the launcher's
+    # CUBLASLT_WORKSPACE_SIZE=0 pin NEVER reached TE's GEMM (this is why the
+    # golden fork's "shrink TE ws" worked on its TE version but was dead here,
+    # and why every te_native arm ran split-K-capable algo families). Setting
+    # NRL_TE_WS_BYTES=<n> monkeypatches the size fn and clears the lru_cache so
+    # cuBLASLt heuristics only see workspace-<=n algos (n~1024 => splitK-free).
+    import os as _os_ws
+    _ws_env = _os_ws.environ.get("NRL_TE_WS_BYTES", "")
+    if _ws_env and not globals().get("_NRL_TE_WS_PATCHED"):
+        globals()["_NRL_TE_WS_PATCHED"] = True
+        import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
+        _ws_n = int(_ws_env)
+        _te_gemm_mod.get_cublas_workspace_size_bytes = lambda: _ws_n
+        if hasattr(_te_gemm_mod.get_cublas_workspace, "cache_clear"):
+            _te_gemm_mod.get_cublas_workspace.cache_clear()
+        import sys as _sys_ws
+        print(f"[NRL_TE_WS_BYTES] TE cuBLAS workspace starved to {_ws_n} bytes "
+              f"(get_cublas_workspace_size_bytes patched, cache cleared)",
+              file=_sys_ws.stderr, flush=True)
+
     # Patch general_gemm once
     if _TE_GENERAL_GEMM_ORIG is None and hasattr(te_cpp, "general_gemm"):
         _TE_GENERAL_GEMM_ORIG = te_cpp.general_gemm
@@ -575,6 +627,34 @@ def _te_patch_for_batch_invariant():
     if _MEG_TE_GENERAL_GEMM_ORIG is None and hasattr(meg_te, "general_gemm"):
         _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
         meg_te.general_gemm = _te_general_gemm_patched
+
+    # PATCH(NRL_BI_KERNELS category scoping, part 2 — THE ROOT CAUSE, 2313338-40):
+    # this fork ALSO patches te.RMSNorm.forward + module-level rmsnorm fns with a BI
+    # reimplementation, but coverage is ASYMMETRIC (LayerNormLinear's fused-internal
+    # norm stays native) -> the two engines' norms diverge on rare rows. Natively all
+    # norm variants are bitwise-identical — skip ALL norm patches in te_gemm modes.
+    import os as _os_bic2
+    _bic2 = _os_bic2.environ.get("NRL_BI_KERNELS", "all")
+    if _bic2 == "te_gemm_norm":
+        # ENDGAME (M-class map 2313867): TE rmsnorm_fwd switches codepaths at M%32==0
+        # (infopt pads to 64 -> always; scoring's natural M -> almost never) -> rare-row
+        # 1-ulp divergence. Rebind the TRUE chokepoint symmetrically in both engines:
+        # every norm caller (LNL-internal python path, standalone, infopt kernel) funnels
+        # through tex.rmsnorm_fwd. The BI Triton norm is bitwise M-invariant (verified).
+        import sys as _sys_n
+        import transformer_engine_torch as _tex_n
+        if not globals().get("_NRL_TEXNORM_PATCHED"):
+            globals()["_NRL_TEXNORM_PATCHED"] = True
+            _orig_rms = _tex_n.rmsnorm_fwd
+            def _rms_fwd_bi(x, w, eps, *rest, **kw):
+                y = rmsnorm_batch_invariant(x, w, float(eps)).to(w.dtype)
+                return (y, None, None)
+            _tex_n.rmsnorm_fwd = _rms_fwd_bi
+            print("[NRL_BI_NORM] tex.rmsnorm_fwd -> BI Triton norm (M-invariant) ACTIVE",
+                  file=_sys_n.stderr, flush=True)
+        return
+    if _bic2 in ("te_gemm", "te_gemm_pure"):
+        return
 
     # Patch RMSNorm.forward once (class may be on te or te.pytorch)
     rms_cls = getattr(te, "RMSNorm", None)
@@ -828,6 +908,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
 
 
 def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
+    _nrl_hit("te_general_gemm", "?")
     """
     Batch-invariant replacement for TE general_gemm.
     Returns a list of tensors to match TE's API: (gemm_out, bias_grad, gelu_input, extra_output)
@@ -836,6 +917,22 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
     # If original not captured, do nothing
     if _TE_GENERAL_GEMM_ORIG is None:
         raise RuntimeError("TE general_gemm original not captured; patching order issue")
+
+    # PATCH(NRL_BI_GEMM_IMPL, GEMM Path-C probe): "native" falls through to the ORIGINAL
+    # TE cuBLASLt general_gemm (nvjet) instead of the BI Triton matmul, under the
+    # workspace pins (CUBLAS_WORKSPACE_CONFIG=:0:0, CUBLASLT_WORKSPACE_SIZE=0) the
+    # launcher already exports. Paired with the same env in inference_layers_det.py so
+    # ONE env flips BOTH engine and scoring dense GEMMs to native. Default "triton"
+    # (certified ship behavior) — this branch is inert unless explicitly set.
+    import os as _os_gi
+    _gi_impl = _os_gi.environ.get("NRL_BI_GEMM_IMPL", "triton")
+    if _gi_impl in ("native", "te_native"):
+        if not globals().get("_NRL_BI_GEMM_NATIVE_BANNER"):
+            globals()["_NRL_BI_GEMM_NATIVE_BANNER"] = True
+            import sys as _sys_gi
+            print(f"[NRL_BI_GEMM_IMPL] scoring general_gemm -> NATIVE cuBLASLt (impl={_gi_impl}, BI Triton bypassed)",
+                  file=_sys_gi.stderr, flush=True)
+        return _TE_GENERAL_GEMM_ORIG(*args, **kwargs)
 
     A, B, out_dtype, layout, out, bias, grad = _extract_te_gemm_args(args, kwargs)
     extra_output = kwargs.get("extra_output", None)
@@ -859,7 +956,36 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         )
 
     # Compute via autograd-aware function matching TE's layout semantics
-    result = BatchInvariantTEGemmFn.apply(A, B, bias if not grad else None, out_dtype, layout)
+    # PATCH(NRL_BI_GEMM_IMPL=aten_native, vLLM-parity probe): route the scoring GEMM
+    # through the SAME aten cuBLAS path (F.linear) the engine's native branch uses.
+    # vLLM's batch_invariant.py claims SM90/SM100 cuBLAS is batch-invariant modulo
+    # split-K (disabled via workspace config) and does NOT Triton-override matmuls
+    # there — this arm tests that claim on our shapes (TE's general_gemm measured
+    # M-VARIANT in 2329429; aten may select a different, invariant kernel family).
+    if _gi_impl == "aten_native":
+        if not globals().get("_NRL_BI_GEMM_ATEN_BANNER"):
+            globals()["_NRL_BI_GEMM_ATEN_BANNER"] = True
+            import sys as _sys_an
+            print("[NRL_BI_GEMM_IMPL] scoring general_gemm -> ATEN F.linear (vLLM-parity arm)",
+                  file=_sys_an.stderr, flush=True)
+        # TN is the forward path (engine parity: EXACT same F.linear call as the
+        # engine's native branch). NN/NT appear only in the training backward
+        # (dgrad/wgrad with 3D activation tensors and dw/db conventions) —
+        # training-internal, no cross-engine match required (gen_kl compares both
+        # sides at the same weights however trained) — so route them to the
+        # ORIGINAL TE general_gemm (nvjet), which owns those semantics.
+        if layout != "TN":
+            return _TE_GENERAL_GEMM_ORIG(*args, **kwargs)
+        _B_flat = B.reshape(-1, B.shape[-1]) if B.dim() > 2 else B
+        result = torch.nn.functional.linear(_B_flat, A)
+        if B.dim() > 2:
+            result = result.reshape(*B.shape[:-1], A.shape[0])
+        if bias is not None and not grad:
+            result = result + bias
+        if out_dtype is not None:
+            result = result.to(out_dtype)
+    else:
+        result = BatchInvariantTEGemmFn.apply(A, B, bias if not grad else None, out_dtype, layout)
 
     bias_grad = None
     if grad and bias is not None:
@@ -970,10 +1096,18 @@ def enable_batch_invariant_mode():
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
-    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
+    import os as _os_bic0
+    _bic = _os_bic0.environ.get("NRL_BI_KERNELS", "all")
+    if _bic != "te_gemm_pure":
+        _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+    # PATCH(NRL_BI_KERNELS category scoping): the blanket aten overrides ALTER the bits
+    # of aten-routed norm/softmax paths but NOT TE's fused-internal kernels -> the two
+    # engines' norms diverge on rare rows (ROOT CAUSE of the two-token seed; norm-env
+    # matrix 2313309). With NRL_BI_KERNELS=te_gemm, patch GEMMs only.
+    if _bic not in ("te_gemm", "te_gemm_pure"):
+        _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available
     _te_patch_for_batch_invariant()
 
