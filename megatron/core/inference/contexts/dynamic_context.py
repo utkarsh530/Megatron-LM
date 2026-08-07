@@ -35,7 +35,6 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
@@ -50,7 +49,7 @@ from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMet
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
-from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
+from .mamba_slot_allocator import MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
 
 try:
@@ -556,8 +555,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Initialize context state.
         self.params_dtype = model_config.params_dtype
-        self.hidden_size = model_config.hidden_size
-        self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.max_sequence_length = inference_config.max_sequence_length
 
         # Block ids. With speculative decoding, blocks are pre-allocated when the
@@ -669,6 +666,38 @@ class DynamicInferenceContext(BaseInferenceContext):
                 sizing_distribution=inference_config.cuda_graph_sizing_distribution,
             )
         )
+        # PATCH(golden bucket-floor): cells A/C proved decode at ladder buckets <64
+        # breaks gen/scoring parity field-wide (~4.6e-4) while M=64 execution is
+        # exactly zero — the small-M kernel regime. Drop sub-64 buckets: steps
+        # smaller than 64 fall through to the native eager 64-quantum rounding
+        # (proven-zero path); graphs capture/replay only at parity-safe sizes.
+        import os as _os_bf
+        if _os_bf.environ.get("NRL_BUCKET_FLOOR_64", "0") == "1" and self.cuda_graph_batch_dimensions_list:
+            # PATCH(golden 64-alignment, v6): the parity regime is M ≡ 0 (mod 64) —
+            # M=64 exact, M=106/26/12 broken eager OR replayed (cells C/D/A + THE run).
+            # v0.5.0's TOKEN_ROUNDER=64 kept every forward in prefill's mod-64 class.
+            # Round every decode bucket UP to the next 64-multiple and dedupe.
+            _seen = set()
+            _new_list = []
+            _cap = min(self.max_tokens, (self.max_requests // 64) * 64)
+            for _d in self.cuda_graph_batch_dimensions_list:
+                _tc = ((max(_d.token_count, 64) + 63) // 64) * 64
+                if _tc > _cap:
+                    _tc = _cap
+                if _tc < 64 or _tc in _seen:
+                    continue
+                _seen.add(_tc)
+                _new_list.append(
+                    InferenceBatchDimensions(
+                        token_count=_tc,
+                        prefill_req_count=_d.prefill_req_count,
+                        decode_req_count=_tc if _d.prefill_req_count == 0 else _d.decode_req_count,
+                    )
+                )
+            print(f"[NRL_BUCKET_FLOOR_64] ladder {len(self.cuda_graph_batch_dimensions_list)} -> "
+                  f"{[_d.token_count for _d in _new_list]} (64-multiples)", flush=True)
+            self.cuda_graph_batch_dimensions_list = _new_list
+            self.cuda_graph_token_counts = [_d.token_count for _d in _new_list]
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
@@ -700,10 +729,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             inference_config.use_flashinfer_fused_rope = HAVE_FLASHINFER
         self.use_flashinfer_fused_rope = inference_config.use_flashinfer_fused_rope
         self.inference_grouped_gemm_backend = model_config.inference_grouped_gemm_backend
-
-        # Placeholder for the MTP decoder hidden-states buffer; allocated inside
-        # initialize_all_tensors() when num_speculative_tokens > 0.
-        self.mtp_decoder_hidden_states = None
 
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
@@ -770,23 +795,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and prefix_caching_mamba_gb > 0
             ):
                 prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
-                # Mirror the split done in _allocate_mamba_cache so this preview
-                # matches what is actually allocated: the "scratch" buffers
-                # (intermediate_ssm_out/intermediate_conv_out) are reserved from the
-                # budget first, then the rest sizes the "durable" cache
-                # (ssm_states/conv_states). mamba_bytes_per_req is the shared
-                # per-slot footprint of both.
-                scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
-                scratch_bytes = scratch_slots * mamba_bytes_per_req
-                durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
-                durable_slots = max(durable_slots, 0)
+                prefix_cache_slots = prefix_cache_bytes // mamba_bytes_per_req
                 log_lines += [
                     f"  Mamba prefix cache:",
                     f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
-                    f"    extraction_scratch:    {scratch_slots} slots "
-                    f"({get_mem_size_str(scratch_bytes)})",
-                    f"    durable_slots:         {durable_slots} "
-                    f"({get_mem_size_str(durable_slots * mamba_bytes_per_req)})",
+                    f"    slots:                 {prefix_cache_slots}",
                     f"    per_slot:              {get_mem_size_str(mamba_bytes_per_req)}",
                 ]
 
@@ -1288,40 +1301,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             and self.config.enable_prefix_caching
         ):
             self._allocate_mamba_cache(self.config.prefix_caching_mamba_gb)
-        elif self.is_hybrid_model and self.config.enable_prefix_caching:
-            # Memory-only mode: prefix caching on a hybrid model without a Mamba
-            # cache budget deduplicates identical KV prefixes for memory savings,
-            # but does NOT cache Mamba recurrent state. Prefill skipping is
-            # therefore disabled (prefix_skip_tokens is forced to 0) and every
-            # token is recomputed, so results stay correct -- but the main latency
-            # benefit of prefix caching is forgone. Warn so a user who expected
-            # full caching knows to set prefix_caching_mamba_gb.
-            logging.warning(
-                "enable_prefix_caching is set on a hybrid (Mamba) model but "
-                "prefix_caching_mamba_gb is not configured (got %r). Running in "
-                "memory-only mode: identical KV prefixes are deduplicated for "
-                "memory savings, but Mamba state caching and prefill skipping are "
-                "disabled (every token is recomputed). Set prefix_caching_mamba_gb "
-                "> 0 to enable full prefix caching.",
-                self.config.prefix_caching_mamba_gb,
-            )
-
-        # MTP speculative decoding: persistent buffer for decoder hidden states.
-        # Only needed for block-scope CUDA graphs, where the Python assignment in
-        # forward() runs only during graph capture. Using copy_() into a fixed
-        # buffer ensures every batch-size graph replay writes to the same GPU
-        # address. Sized to max_tokens; only [:actual_tokens] is valid each step.
-        if (
-            self.num_speculative_tokens > 0
-            and self.inference_cuda_graph_scope == InferenceCudaGraphScope.block
-        ):
-            self.mtp_decoder_hidden_states = torch.empty(
-                self.max_tokens,
-                1,
-                self.hidden_size,
-                device=torch.cuda.current_device(),
-                dtype=self.params_dtype,
-            )
 
         # Reset tensor-related metadata.
         self.reset_metadata()
@@ -1650,34 +1629,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         ssm_size = _math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
         per_slot_bytes = self.num_mamba_layers * (conv_size + ssm_size)
         total_bytes = int(mamba_gb * 1024**3)
-
-        # MambaSlotAllocator allocates two GPU buffer families with the same
-        # per-slot footprint, both of which must fit in this budget:
-        #   - "durable" cache:  self.ssm_states / self.conv_states, sized to
-        #                       `max_slots` slots (computed below).
-        #   - "scratch" buffers: self.intermediate_ssm_out / self.intermediate_conv_out,
-        #                       fixed CUDA-graph-safe staging for intermediate-state
-        #                       extraction, sized to the per-step worst case of
-        #                       `scratch_slots` = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
-        #                       * max_requests slots.
-        # The scratch is not part of the durable cache but consumes the same
-        # per-slot bytes, so reserve it from the budget up front before sizing the
-        # durable cache; otherwise total usage silently exceeds mamba_gb (and can
-        # OOM) when scratch_slots > max_slots.
-        scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
-        scratch_bytes = scratch_slots * per_slot_bytes
-        max_slots = (total_bytes - scratch_bytes) // per_slot_bytes  # durable slots
+        max_slots = total_bytes // per_slot_bytes
         if max_slots < 1:
-            raise ValueError(
-                f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
-                f"is too small. The CUDA-graph extraction scratch reserves "
-                f"{scratch_bytes / 1024**3:.4g} GB ({scratch_slots} slots = "
-                f"{MAX_INTERMEDIATE_OFFSETS_PER_REQUEST} offsets x {self.max_requests} "
-                f"requests x {per_slot_bytes / 1024:.1f} KB/slot), leaving room for "
-                f"fewer than one durable cache slot. Increase prefix_caching_mamba_gb "
-                f"to at least {(scratch_bytes + per_slot_bytes) / 1024**3:.4g} GB, or "
-                f"reduce max_requests."
+            logging.warning(
+                "Mamba cache budget (%.3f GB) too small for even 1 slot "
+                "(need %.3f GB per slot). Mamba caching disabled.",
+                mamba_gb,
+                per_slot_bytes / 1024**3,
             )
+            return
 
         self.mamba_slot_allocator = MambaSlotAllocator(
             context=self,
@@ -1693,14 +1653,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         logging.info(
-            "Mamba prefix cache: %d durable slots (%.3f GB) + %d scratch slots "
-            "(%.3f GB) = %.3f GB total within %.3f GB budget, per-slot %.1f KB",
+            "Mamba prefix cache: %d slots (%.3f GB), per-slot %.1f KB",
             max_slots,
             max_slots * per_slot_bytes / 1024**3,
-            scratch_slots,
-            scratch_bytes / 1024**3,
-            (max_slots + scratch_slots) * per_slot_bytes / 1024**3,
-            mamba_gb,
             per_slot_bytes / 1024,
         )
 
@@ -2177,6 +2132,96 @@ class DynamicInferenceContext(BaseInferenceContext):
             ep_zmq_communicator=self._ep_zmq_communicator,
         )
         self._using_cuda_graph_this_step = best_graph is not None
+        # PATCH(NRL_FORCE_NOGRAPH_STEP): run every step with full eager bookkeeping
+        # (eager dims, non-graphed metadata, no decode->prefill reclassification)
+        # even under cuda_graph_impl=local. Layer graphs must be bypassed too
+        # (NRL_EAGER_LAYERS=all) since no bucket dims are produced.
+        import os as _os_fng
+        # PATCH(NRL_OPHASH support): serving-step counter + bookkeeping trace
+        import builtins as _bi
+        _bi._NRL_GRAPH_WARMUP = construct_graph_dimensions is not None
+
+        # publish the live GPU kv-length buffer for the in-graph gdump recorder
+        # (fixed storage; captured reads see per-step values on replay)
+        if getattr(_bi, "_NRL_KV_GPU", None) is None:
+            _kv_t = None
+            for _kvn in ("request_kv_length_offsets", "kv_length_offsets",
+                         "request_kv_lengths"):
+                _kv_t = getattr(self.gpu_view, _kvn, None)
+                if _kv_t is not None:
+                    break
+            if _kv_t is not None:
+                _bi._NRL_KV_GPU = _kv_t
+                print(f"[NRL_GDUMP] kv meta source: gpu_view.{_kvn} "
+                      f"shape={tuple(_kv_t.shape)} dtype={_kv_t.dtype}", flush=True)
+            elif not getattr(_bi, "_NRL_KV_WARNED", False):
+                _bi._NRL_KV_WARNED = True
+                print("[NRL_GDUMP] WARNING: no kv-length field on gpu_view; attrs="
+                      + ",".join(a for a in dir(self.gpu_view) if not a.startswith("__")),
+                      flush=True)
+        if construct_graph_dimensions is None:
+            _bi._NRL_STEP = getattr(_bi, "_NRL_STEP", 0) + 1
+            if _bi._NRL_STEP == 1:
+                # zero the gdump slot counter so graph-capture pollution doesn't
+                # consume buffer capacity (STOP-AT-FULL needs it for live steps)
+                try:
+                    import sys as _sys_gdr
+                    _il = _sys_gdr.modules.get("megatron.core.tensor_parallel.inference_layers")
+                    if _il is not None and hasattr(_il, "_NRL_GD_CNT"):
+                        _il._NRL_GD_CNT.zero_()
+                except Exception:
+                    pass
+            # PATCH(NRL_NSYS_WINDOW="start,end"): cudaProfilerStart/Stop at serving-step
+            # boundaries + python-level NVTX auto-annotation (nvtx.Profile) + aten NVTX
+            # (emit_nvtx) inside the window. Use with nsys -c cudaProfilerApi.
+            import os as _os_nw
+            _w = _os_nw.environ.get("NRL_NSYS_WINDOW", "")
+            if _w and _os_nw.environ.get("RANK", "0") == "0":
+                _a, _b = (int(v) for v in _w.split(","))
+                if _bi._NRL_STEP == _a and not getattr(_bi, "_NRL_NW_ON", False):
+                    _bi._NRL_NW_ON = True
+                    import torch as _t_nw
+                    _t_nw.cuda.profiler.start()
+                    try:
+                        import nvtx as _nvtx
+                        _bi._NRL_NW_PYPROF = _nvtx.Profile()
+                        _bi._NRL_NW_PYPROF.enable()
+                    except Exception as _e_nw:
+                        print(f"[NRL_NSYS] nvtx.Profile unavailable: {_e_nw}", flush=True)
+                    _bi._NRL_NW_EMIT = _t_nw.autograd.profiler.emit_nvtx()
+                    _bi._NRL_NW_EMIT.__enter__()
+                    print(f"[NRL_NSYS] window OPEN at step {_a}", flush=True)
+                elif _bi._NRL_STEP == _b and getattr(_bi, "_NRL_NW_ON", False):
+                    _bi._NRL_NW_ON = False
+                    import torch as _t_nw
+                    if getattr(_bi, "_NRL_NW_PYPROF", None) is not None:
+                        _bi._NRL_NW_PYPROF.disable()
+                    _bi._NRL_NW_EMIT.__exit__(None, None, None)
+                    _t_nw.cuda.profiler.stop()
+                    print(f"[NRL_NSYS] window CLOSED at step {_b}", flush=True)
+        if (_os_fng.environ.get("NRL_FORCE_NOGRAPH_STEP", "0") == "1"
+                and construct_graph_dimensions is None):
+            if self._using_cuda_graph_this_step and not getattr(type(self), "_nrl_fng_banner", False):
+                type(self)._nrl_fng_banner = True
+                print("[NRL_FORCE_NOGRAPH_STEP] eager bookkeeping forced for all steps", flush=True)
+            best_graph = None
+            self._using_cuda_graph_this_step = False
+        # PATCH(golden root-cause): nightly matches graph buckets even when CUDA
+        # graphs are DISABLED (cuda_graph_impl=none), which (a) shadows the native
+        # eager 64-quantum rounding below with tiny ladder buckets (the small-M
+        # drain tail) and (b) makes the controller's moe_pad toggle believe eager
+        # steps are graph steps, enabling the router capacity path and leaking it
+        # into scoring. NRL_FORCE_EAGER_DIMS=1 restores true-eager semantics.
+        import os as _os_fed
+        if (
+            _os_fed.environ.get("NRL_FORCE_EAGER_DIMS", "0") == "1"
+            and construct_graph_dimensions is None
+        ):
+            if self._using_cuda_graph_this_step and not getattr(type(self), "_nrl_fed_banner", False):
+                type(self)._nrl_fed_banner = True
+                print("[NRL_FORCE_EAGER_DIMS] suppressing spurious bucket match (impl=none)", flush=True)
+            best_graph = None
+            self._using_cuda_graph_this_step = False
 
         if construct_graph_dimensions is not None:
             assert self._using_cuda_graph_this_step
@@ -2211,8 +2256,51 @@ class DynamicInferenceContext(BaseInferenceContext):
                 prefill_req_count=padded_prefill_req_count,
                 decode_req_count=padded_decode_req_count,
             )
+        # PATCH(golden-replication small-M fix v2): v0.5.0 ran eager decode forwards
+        # at TOKEN_ROUNDER(=64)-quantized M; nightly's eager path uses graph-ladder
+        # quanta down to M=1, exposing a small-M kernel regime (M<=6) whose per-row
+        # rounding differs from M>=12/prefill and compounds across layers into the
+        # drain-phase logprob tail. NRL_MIN_TOKEN_PAD=1 rounds padded_batch_dimensions
+        # itself so ALL consumers (attention metadata reshapes included) agree.
+        import os as _os_pad
+        if (
+            _os_pad.environ.get("NRL_MIN_TOKEN_PAD", "0") == "1"
+            and self.padded_batch_dimensions.token_count > 0
+            and not self.is_creating_cuda_graphs
+        ):
+            _dims = self.padded_batch_dimensions
+            # Pure-decode steps only: 1 token == 1 request in decode, so the padded
+            # request count must move WITH the token count (attention metadata
+            # reshapes tokens as [reqs, tokens//reqs, ...]). Mirrors the graph-bucket
+            # dummy-decode regime the warmup path already exercises. Prefill steps
+            # are already large-M and left untouched.
+            if _dims.prefill_req_count == 0 and _dims.token_count == _dims.decode_req_count:
+                _tc = _dims.token_count
+                _new_tc = min(self.round_up_tokens(_tc), self.max_tokens, self.max_requests)
+                if _new_tc > _tc:
+                    if not getattr(type(self), "_nrl_pad_banner", False):
+                        type(self)._nrl_pad_banner = True
+                        print(f"[NRL_MIN_TOKEN_PAD] decode step M {_tc} -> {_new_tc} (tokens+requests, 64-quantum)", flush=True)
+                    self.padded_batch_dimensions = InferenceBatchDimensions(
+                        token_count=_new_tc,
+                        prefill_req_count=0,
+                        decode_req_count=_new_tc,
+                    )
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
+        # publish the GLOBALLY-CONSISTENT bucket token count for the det combine's
+        # a2a sizing (v7). The a2a size MUST be identical on every EP rank or NCCL
+        # deadlocks (v6 used per-rank padded_active_token_count, which differs
+        # across DP-sharded ranks -> ALLTOALL timeout). construct_graph_dimensions
+        # is the EP-synced bucket being captured (same on all ranks); the a2a size
+        # is baked at CAPTURE, so this is the only moment it must be correct. Eager
+        # / non-capture steps publish a large sentinel -> combine falls back to the
+        # worst-case buffer (safe, globally consistent).
+        import builtins as _bi_pt
+        if construct_graph_dimensions is not None:
+            _bi_pt._NRL_PADDED_TOK = int(construct_graph_dimensions.token_count)
+        else:
+            _bi_pt._NRL_PADDED_TOK = 1 << 30
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
         self.build_active_slices(
@@ -2231,9 +2319,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count : self.padded_active_token_count
         ] = 0
 
+        import os as _os_ngm
+        _nrl_ngm = _os_ngm.environ.get("NRL_NONGRAPH_META", "0") == "1"
         self.active_attn_metadata = (
             self.graph_attn_metadata  # type: ignore[assignment]
-            if self.using_cuda_graph_this_step()
+            if (self.using_cuda_graph_this_step() and not _nrl_ngm)
             else self.non_graph_attn_metadata  # type: ignore[assignment]
         )
 
@@ -2244,7 +2334,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
 
         attn_dimensions = batch_dimensions
-        if self.using_cuda_graph_this_step():
+        import os as _os_rcl
+        _nrl_rcl = _os_rcl.environ.get("NRL_NO_RECLASS", "0") == "1"
+        if self.using_cuda_graph_this_step() and not _nrl_rcl:
             # Treat some decode requests as prefill requests to fit the cuda graph batch dimension.
             if batch_dimensions.decode_req_count > self.padded_batch_dimensions.decode_req_count:
                 total_req = batch_dimensions.req_count
@@ -2307,7 +2399,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._cpu_mha_block_table[real_bs:padded_bs] = -1
 
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
-        if not self.using_cuda_graph_this_step() and real_bs > 0:
+        import os as _os_msl
+        _force_live = _os_msl.environ.get("NRL_LIVE_MAXSEQ", "0") == "1"
+        if (_force_live or not self.using_cuda_graph_this_step()) and real_bs > 0:
             # NonGraphedMHAMetadata: use actual max values.
             max_seqlen_q = self._cpu_mha_query_lengths[:real_bs].max().item()
             max_seqlen_k = self._cpu_mha_kv_seq_lengths[:real_bs].max().item()
@@ -2333,6 +2427,42 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
         )
+        # PATCH(NRL_BOOKDUMP): per-step bookkeeping trace (host-side, tiny)
+        import os as _os_bd
+        _bd = _os_bd.environ.get("NRL_BOOKDUMP", "")
+        if _bd:
+            # ALL ranks: requests are DP-sharded across EP ranks (16 reqs / 8
+            # ranks = 2 per context) — rank0-only dumping was blind to 7/8
+            import builtins as _bi2
+            _fh = getattr(_bi2, "_NRL_BOOK_FH", None)
+            if _fh is None:
+                # append-mode JSONL, flushed per record: no saver thread, no
+                # tail loss when the server is SIGKILLed (the .pt saver lost
+                # everything after its last 2s tick — 2323180 died at step 264)
+                _rk = _os_bd.environ.get("RANK", "0")
+                _fh = _bi2._NRL_BOOK_FH = open(
+                    _bd + f"/bookdump_rank{_rk}.jsonl", "a", buffering=1)
+            def _dims(d):
+                return None if d is None else (d.token_count, d.prefill_req_count, d.decode_req_count)
+            import json as _js_bd
+            _rec = ({
+                "step": getattr(__import__("builtins"), "_NRL_STEP", -1),
+                "graphed": bool(self.using_cuda_graph_this_step()),
+                "batch_dims": _dims(batch_dimensions),
+                "padded_dims": _dims(self.padded_batch_dimensions),
+                "attn_dims": _dims(attn_dimensions),
+                "real_bs": int(real_bs), "padded_bs": int(padded_bs),
+                "msq": int(max_seqlen_q), "msk": int(max_seqlen_k),
+                "cu_q": self._cpu_mha_cu_query_seq_lengths[:6].tolist() if hasattr(self, "_cpu_mha_cu_query_seq_lengths") else None,
+                "kv_len": self._cpu_mha_kv_seq_lengths[:4].tolist(),
+                "btab0": int(self._cpu_mha_block_table[0, 0]) if self._cpu_mha_block_table.numel() else None,
+                "active_tok": int(self.active_token_count),
+                "padded_tok": int(self.padded_active_token_count),
+            })
+            try:
+                _fh.write(_js_bd.dumps(_rec) + "\n")
+            except Exception:
+                pass
 
         if self.is_hybrid_model:
             # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()

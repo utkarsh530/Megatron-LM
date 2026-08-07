@@ -279,6 +279,19 @@ class CUDAGraphBatchDimensionBuilder:
 
         rounder = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
 
+        # PATCH(NRL_DET_INFOPT_M64): force every cuda-graph token count to a 64-multiple
+        # (floor 64) so decode/mixed/prefill steps all execute dense GEMMs in the same
+        # cuBLASLt M-regime as TE scoring (the 64-alignment law; EXACT_ZERO_CAMPAIGN.md).
+        import os as _os_m64
+        _nrl_m64 = _os_m64.environ.get("NRL_DET_INFOPT_M64", "0") == "1"
+        if _nrl_m64:
+            rounder = 64
+            cuda_graph_max_tokens = max(64, (cuda_graph_max_tokens // 64) * 64)
+            if not globals().get("_NRL_M64_BANNER"):
+                globals()["_NRL_M64_BANNER"] = True
+                print("[NRL_DET_INFOPT_M64] 64-multiple cuda-graph token ladder ACTIVE "
+                      f"(max={cuda_graph_max_tokens})", flush=True)
+
         # Cuda graph step size.
         cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
         cuda_graph_step_size = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER * int(
@@ -311,7 +324,8 @@ class CUDAGraphBatchDimensionBuilder:
 
         # Always include the endpoints: cuda_graph_max_tokens (largest) and tp_size (smallest).
         sizes.add(cuda_graph_max_tokens)
-        sizes.add(tp_size)
+        # PATCH(NRL_DET_INFOPT_M64): smallest bucket is 64, never tp_size.
+        sizes.add(64 if _nrl_m64 else tp_size)
 
         cuda_graph_token_counts = sorted(sizes, reverse=True)
 
@@ -429,6 +443,19 @@ class CUDAGraphBatchDimensionBuilder:
 
         def add_if_valid(token_count: int, prefill_req_count: int, decode_req_count: int) -> None:
             """Helper to create and append batch dimension to list only if it's valid."""
+            # PATCH(NRL_DET_INFOPT_M64): floor EVERY graph bucket's token_count at a
+            # 64-multiple — the num_cuda_graphs==-1 auto-sizing path injects 1- and
+            # 2-token decode buckets that bypass the ladder floor, putting graphed
+            # decode norms in the M%32!=0 bit-class (root-cause #1's law). Eager
+            # decode pads tokens to 64 (TOKEN_ROUNDER); graphs must match.
+            import os as _os_aiv
+            if _os_aiv.environ.get("NRL_DET_INFOPT_M64", "0") == "1":
+                _tc64 = max(64, ((token_count + 63) // 64) * 64)
+                if _tc64 != token_count and not globals().get("_NRL_M64_AIV_BANNER"):
+                    globals()["_NRL_M64_AIV_BANNER"] = True
+                    print(f"[NRL_DET_INFOPT_M64] bucket token floor: {token_count} -> {_tc64} "
+                          f"(pf={prefill_req_count}, dec={decode_req_count})", flush=True)
+                token_count = _tc64
             batch_dim = InferenceBatchDimensions(token_count, prefill_req_count, decode_req_count)
             if batch_dim.is_valid(max_requests, max_sequence_length, num_speculative_tokens):
                 cuda_graph_batch_dimensions_list.append(batch_dim)

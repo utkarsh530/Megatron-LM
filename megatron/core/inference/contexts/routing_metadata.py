@@ -54,6 +54,15 @@ class RoutingMetadata:
             device=self.device,
         )
 
+    # PATCH(golden-replication colocated harvest): in a COLOCATED worker the
+    # RouterReplay global instance list holds routers from EVERY model in the
+    # process (policy model + reference model). Only the generating model's
+    # routers record during an engine step; the rest stay None, and the stock
+    # eager branch bails on `recorded_data[0] is None` / stacks a ragged list.
+    # Filter to the instances that actually recorded this step. Layer order is
+    # preserved because instances register in creation (layer) order.
+    _nrl_diag_printed = False
+
     def get_routing_indices(self) -> Optional[torch.Tensor]:
         """Get the recorded routing indices.
 
@@ -74,11 +83,26 @@ class RoutingMetadata:
             # Get from RouterReplay and stack into [num_tokens, num_layers, topk].
             recorded_data = RouterReplay.get_recorded_data()
             if recorded_data is None or len(recorded_data) == 0:
+                if not RoutingMetadata._nrl_diag_printed:
+                    RoutingMetadata._nrl_diag_printed = True
+                    print(
+                        f"[NRL_RM_HARVEST] eager harvest: recorded_data empty "
+                        f"(instances={len(RouterReplay.global_router_replay_instances)})",
+                        flush=True,
+                    )
                 return None
-            if recorded_data[0] is None:
+            non_none = [d for d in recorded_data if d is not None]
+            if not RoutingMetadata._nrl_diag_printed:
+                RoutingMetadata._nrl_diag_printed = True
+                print(
+                    f"[NRL_RM_HARVEST] eager harvest: instances={len(recorded_data)} "
+                    f"recorded={len(non_none)}",
+                    flush=True,
+                )
+            if len(non_none) == 0:
                 return None
             # Stack: list of [num_tokens, topk] -> [num_tokens, num_layers, topk]
-            return torch.stack(recorded_data, dim=1)
+            return torch.stack(non_none, dim=1)
 
     def enable_static_buffer_recording(self) -> None:
         """Enable recording into the static buffer for CUDA graph compatibility.
