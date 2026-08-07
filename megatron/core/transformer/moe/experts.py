@@ -916,7 +916,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             HAVE_FLASHINFER
         ), "flashinfer-python is required to resolve FlashInfer activation type."
         func = self.config.activation_func
-        if func == F.silu:
+        if func == F.silu and self.config.gated_linear_unit:
+            return ActivationType.Swiglu  # PATCH: gated SiLU -> SwiGLU (cutlass uses mInnerDimMultiplier=2 for gated FC1)
+        elif func == F.gelu and self.config.gated_linear_unit:
+            return ActivationType.Geglu  # PATCH: gated GELU -> GeGLU
+        elif func == F.silu:
             return ActivationType.Silu
         elif func == F.gelu:
             return ActivationType.Gelu
@@ -931,7 +935,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
         func = self.config.activation_func
         if func == squared_relu:
             return McoreActivationType.SQUARED_RELU
-        raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
+        if func == F.silu and self.config.gated_linear_unit:
+            return McoreActivationType.SWIGLU  # PATCH: mcore padded_swiglu supports gated SwiGLU
+        return None  # PATCH: defer; other backends resolve their own activation
 
     def _build_concatenated_mxfp8_weights(self):
         """Build stacked MXFP8 weight tensors from per-expert MXFP8Tensor attributes.
@@ -1049,6 +1055,17 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
+        # PATCH(feed-fix): the GPT inference_optimized path delivers the training-style DENSE
+        # routing (routing_map: bool [tokens, num_experts]; probs: fp32 [tokens, num_experts],
+        # nonzero only at selected experts). mcore_fused_moe/permute_tokens expects the compact
+        # [tokens, topk] index-list format (what the hybrid/Nano path delivers). Convert via
+        # torch.topk on the dense probs: fixed output shape + no host sync => CUDA-graph safe.
+        # Selected experts have prob > 0, so topk recovers exactly the router's selection;
+        # all-zero (padded) rows yield arbitrary indices with prob 0 => zero-weighted at
+        # unpermute and within the output_size budget (<= topk distinct experts per token).
+        if routing_map is not None and routing_map.dtype == torch.bool:
+            k = self.config.moe_router_topk
+            probs, routing_map = torch.topk(probs, k, dim=-1)
         output = mcore_fused_moe(
             hidden_states,
             probs,
@@ -1067,6 +1084,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
+        # PATCH(feed-fix): same dense-mask→index-list conversion as _mcore_fused_moe_forward.
+        # The GPT inference_optimized path delivers routing_map as a bool [tokens, num_experts]
+        # mask + dense probs; _moe_align/_moe_sum expect [tokens, topk] indices. torch.topk is
+        # fixed-shape + sync-free => CUDA-graph safe.
+        if routing_map is not None and routing_map.dtype == torch.bool:
+            k = self.config.moe_router_topk
+            probs, routing_map = torch.topk(probs, k, dim=-1)
         output = vllm_fused_moe(
             hidden_states,
             probs,

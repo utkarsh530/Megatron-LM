@@ -31,6 +31,9 @@ if not HAVE_TRITON:
 
 _NUM_SMS: Optional[int] = None
 
+# PATCH(probe): counter for the routing_map format probe in permute_tokens
+_RMAP_PROBE_CALLS = 0
+
 
 def _get_num_sms(device: torch.device) -> int:
     global _NUM_SMS
@@ -240,6 +243,7 @@ def _permute_tokens_kernel(
     out_probs_ptr,  # [output_size] output: permuted probabilities
     out_src_idx_ptr,  # [output_size] output: permutation_map (original token index, -1 for padding)
     counters_ptr,  # [num_local_experts] exclusive offsets, atomically incremented
+    inclusive_ptr,  # PATCH: [num_local_experts] inclusive offsets = per-expert upper bound on pos
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
     hidden_dim,  # hidden dimension
     max_pairs,  # max_tokens * topk (fixed for CG)
@@ -270,18 +274,28 @@ def _permute_tokens_kernel(
             if lid >= 0 and lid < num_local_experts:
                 # Atomically claim a position within this expert's aligned block
                 pos = tl.atomic_add(counters_ptr + lid, 1)
-                # Copy hidden state row
-                for h in tl.range(0, hidden_dim, BLOCK_H):
-                    o = h + tl.arange(0, BLOCK_H)
-                    m = o < hidden_dim
-                    tl.store(
-                        out_hidden_ptr + pos * hidden_dim + o,
-                        tl.load(hidden_ptr + tok * hidden_dim + o, mask=m),
-                        mask=m,
-                    )
-                tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
-                # Record source token index for unpermute
-                tl.store(out_src_idx_ptr + pos, tok)
+                # PATCH: per-expert upper bound. In a self-consistent count->fill pass
+                # pos < upper ALWAYS holds (fill count == counted); this guard is a no-op.
+                # It only fires when the permute fill disagrees with the count pass
+                # (routing_map/valid_tokens hazard), in which case the excess row would
+                # otherwise walk past this expert's block, corrupt the next expert's
+                # region, and eventually overrun output_size (the observed MMU fault).
+                # Dropping the excess leaves it as a -1 padding row that downstream
+                # activation/unpermute already skip.
+                upper = tl.load(inclusive_ptr + lid)
+                if pos < upper:
+                    # Copy hidden state row
+                    for h in tl.range(0, hidden_dim, BLOCK_H):
+                        o = h + tl.arange(0, BLOCK_H)
+                        m = o < hidden_dim
+                        tl.store(
+                            out_hidden_ptr + pos * hidden_dim + o,
+                            tl.load(hidden_ptr + tok * hidden_dim + o, mask=m),
+                            mask=m,
+                        )
+                    tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
+                    # Record source token index for unpermute
+                    tl.store(out_src_idx_ptr + pos, tok)
 
 
 def permute_tokens(
@@ -321,6 +335,27 @@ def permute_tokens(
     max_tokens, hidden_dim = hidden_states.shape
     topk = probs.shape[1]
 
+    # PATCH(probe): dump routing_map format on the first eager calls to test the
+    # dense-mask-vs-index-list hypothesis. Syncs (.min/.tolist) are ILLEGAL during
+    # CUDA-graph capture, so guard with is_current_stream_capturing.
+    global _RMAP_PROBE_CALLS
+    if _RMAP_PROBE_CALLS < 6 and not torch.cuda.is_current_stream_capturing():
+        _RMAP_PROBE_CALLS += 1
+        try:
+            _vt = int(valid_tokens.item()) if valid_tokens.numel() == 1 else -1
+            print(
+                f"[RMAP_PROBE] call={_RMAP_PROBE_CALLS} dtype={routing_map.dtype} "
+                f"shape={tuple(routing_map.shape)} min={int(routing_map.min())} "
+                f"max={int(routing_map.max())} row0[:16]={routing_map[0][:16].tolist()} "
+                f"probs_dtype={probs.dtype} probs_shape={tuple(probs.shape)} "
+                f"probs_row0[:8]={[round(float(x),4) for x in probs[0][:8].tolist()]} "
+                f"valid_tokens={_vt} local_expert_start={local_expert_start} "
+                f"num_local_experts={num_local_experts}",
+                flush=True,
+            )
+        except Exception as _e:
+            print(f"[RMAP_PROBE] failed: {_e}", flush=True)
+
     # Count how many (token, topk) pairs are routed to each local expert.
     # Non-local experts and rows beyond valid_tokens are ignored.
     tokens_per_expert = compute_local_tokens_per_expert(
@@ -336,6 +371,19 @@ def permute_tokens(
     )
     # Output sized at max to keep allocations fixed across steps (CUDA graph compatible).
     output_size = max_tokens * min(topk, num_local_experts) + alignment * num_local_experts
+
+    # PATCH: output_size assumes each token contributes <= min(topk, num_local_experts) LOCAL
+    # pairs (true for real routing: a token selects distinct experts, so <= num_local_experts
+    # land on this rank). But degenerate routing — notably the CUDA-graph WARMUP's synthetic
+    # routing_map, which can point many of a token's slots at the same local expert — makes
+    # tokens_per_expert (and thus these offsets) exceed output_size, overflowing the fixed
+    # permute output buffers (observed: Warp MMU Fault on the out_hidden[pos] store, topk-8
+    # Qwen EP8). Clamp the aligned offsets to the physical buffer size so the permute kernel's
+    # pos<inclusive guard bounds to output_size and grouped_mm's `offs` never exceed the buffer.
+    # Excess pairs are dropped (left as -1 padding rows that downstream kernels skip). No-op for
+    # real routing (offsets already <= output_size); only engages on degenerate/warmup routing.
+    exclusive_expert_offsets = torch.clamp(exclusive_expert_offsets, max=output_size)
+    inclusive_expert_offsets = torch.clamp(inclusive_expert_offsets, max=output_size)
 
     permuted_hidden = torch.empty(
         output_size, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device
@@ -356,6 +404,7 @@ def permute_tokens(
         permuted_probs,
         permutation_map,
         exclusive_expert_offsets,
+        inclusive_expert_offsets,  # PATCH: per-expert upper bound to bound pos
         valid_tokens,
         hidden_dim,
         max_pairs,

@@ -1351,7 +1351,7 @@ class TransformerConfig(ModelParallelConfig):
                     "to avoid costly dtype conversions during decode."
                 )
 
-            if self.gated_linear_unit:
+            if self.gated_linear_unit and str(getattr(self, "inference_grouped_gemm_backend", "")).lower().split(".")[-1] not in ("flashinfer", "torch", "vllm"):  # PATCH: flashinfer + torch(mcore padded_swiglu) + vllm support gated SwiGLU
                 raise ValueError(
                     "--transformer-impl='inference_optimized' does not yet support "
                     "gated linear units (SwiGLU/GeGLU)."

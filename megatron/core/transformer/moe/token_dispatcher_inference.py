@@ -196,15 +196,34 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             self.update_metadata(hidden_states.shape[0])
 
         if not self.__class__._use_allgather_v:
-            # CG path: equal token counts, standard gather.
+            # PATCH(fused-gather + feed-fix): the stock CG path issues THREE AllGathers per
+            # MoE layer (routing_map, probs, hidden) — each ~23µs of mostly launch/ring
+            # latency (profiled: 3.00 AG instances per layer, 68.7µs vs vLLM's single 30µs).
+            # Fuse them into ONE collective by byte-packing the three tensors along dim1
+            # (shapes are graph-bucket-static => capture-safe). Also convert the GPT path's
+            # dense routing (bool [T, num_experts] + dense probs) to the compact
+            # [T, topk] index format BEFORE the gather — shrinks gathered bytes ~11% and
+            # makes the downstream (experts-level) conversion a no-op.
             with torch.no_grad():
-                self.routing_map = gather_from_sequence_parallel_region(
-                    self.routing_map, group=self.tp_ep_group
+                rmap = self.routing_map
+                if rmap is not None and rmap.dtype == torch.bool:
+                    probs, rmap = torch.topk(probs, self.config.moe_router_topk, dim=-1)
+                t = hidden_states.shape[0]
+                h8 = hidden_states.contiguous().view(torch.uint8)          # [T, 2H] uint8
+                p8 = probs.contiguous().view(torch.uint8)                  # [T, 4*topk]
+                r8 = rmap.contiguous().view(torch.uint8)                   # [T, 8*topk]
+                nh, np_, nr = h8.shape[1], p8.shape[1], r8.shape[1]
+                packed = torch.cat((h8, p8, r8), dim=1)                    # [T, nh+np+nr]
+                gathered = gather_from_sequence_parallel_region(
+                    packed, group=self.tp_ep_group
+                )                                                          # [ep*T, ...]
+                hidden_states = (
+                    gathered[:, :nh].contiguous().view(torch.bfloat16)
                 )
-            probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
-            hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, group=self.tp_ep_group
-            )
+                probs = gathered[:, nh : nh + np_].contiguous().view(torch.float32)
+                self.routing_map = (
+                    gathered[:, nh + np_ :].contiguous().view(torch.int64)
+                )
             return hidden_states, probs
 
         # Non-CG path: pad → AllGather → compact.
@@ -397,6 +416,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             "ep_agv_p", process_group=ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
         ).maybe_get_tensor(agv_p_shape, dtype=torch.float32)
 
+        # PATCH(bf16-combine): RSV buffer in bf16 instead of fp32. _moe_sum still
+        # accumulates in fp32 in-register and tl.store casts on write; the cross-rank
+        # multimem.ld_reduce then sums bf16 partials — the same numerics as vLLM's
+        # bf16 ReduceScatter (profiled: vLLM RS 22.0µs bf16 vs mcore 29.1µs f32).
+        # Halves RSV bytes; kernel supports bf16 natively (REDUCE_F32=False path).
         cls._symm_rsv = SymmetricMemoryManager.get_buffer(
             "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
         ).maybe_get_tensor(rsv_shape, dtype=torch.float32)
@@ -494,6 +518,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         full hidden_states; the dispatcher does not launch it here.
         """
         self.hidden_shape = hidden_states.shape
+        # PATCH(feed-fix): the GPT inference_optimized path delivers dense routing
+        # (bool [tokens, num_experts] mask + dense fp32 probs). The NVLS symmetric
+        # buffers and AGV kernels expect the compact [tokens, topk] int64 index format
+        # (see token_dispatch docstring) — the dense feed trips
+        # "hidden_size mismatch: 128 vs 8" in multimem_all_gatherv_3tensor.
+        # Convert once, BEFORE dispatch, with the same graph-safe torch.topk used at
+        # the experts level (fixed shapes, no host sync). No-op for index-format
+        # feeds (e.g. the hybrid/Nano path).
+        if routing_map is not None and routing_map.dtype == torch.bool:
+            probs, routing_map = torch.topk(probs, self.topk, dim=-1)
         if self.shared_experts is not None and not self._external_shared_expert_launch:
             stream = SharedExpertMLP.stream
             stream.wait_stream(torch.cuda.current_stream())
@@ -550,6 +584,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         topk = probs.shape[1]
         hidden_dim = hidden_states.shape[1]
+        # NOTE(bucket-views, ABANDONED): slicing these views to local_tokens*ep_size
+        # gave 21.1k tok/s (jobs 2296928/2296932) but corrupts output whenever per-rank
+        # token counts are unequal (eager chunked prefill; and NVLS decode graphs are
+        # not shape-lockstep across ranks — that's the point of AGV). The worst-case
+        # elementwise cost is instead fixed INSIDE vllm_fused_moe with a device-bounded
+        # SwiGLU kernel gated by valid_tokens (see bounded_silu_mul in activations.py),
+        # which makes no packing or lockstep assumptions.
         self.routing_map = agv_r["tensor"].view(global_max, topk)
         probs = agv_p["tensor"].view(global_max, topk)
         hidden_states = agv_h["tensor"].view(global_max, hidden_dim)
@@ -581,13 +622,48 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         rsv = self.__class__._symm_rsv
 
         if hidden_states is not rsv["tensor"]:
-            rsv["tensor"].copy_(hidden_states)
+            # PATCH(bucket-views): hidden_states may be a bucket-sized slice; copy into
+            # the matching front of the RSV buffer (valid range only).
+            rsv["tensor"][: hidden_states.shape[0]].copy_(hidden_states)
         output = torch.empty(
             self._local_tokens,
             hidden_states.shape[1],
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
+        # PATCH(NRL_COMBINE_RANKGROUP_FP64): deterministic cross-rank combine —
+        # in-switch multimem reduction sums in hardware order (rare 1-ulp flips vs
+        # scoring = the in-RL gen_kl residual; convicted by in-vivo layer diff).
+        # Replace: a2a fp32 partials (static per-rank blocks, graph-capturable) +
+        # LOCAL fp64 sum (exact for <=8 fp32 addends => order-independent).
+        import os as _os_dc
+        if _os_dc.environ.get("NRL_COMBINE_ENGINE_A2A", "0") == "1":
+            # ZERO-CERTIFIED (job 2325025, gen_kl 0.000e+00 x6 @ ~370 tok/s):
+            # exact deterministic cross-rank combine. allgather the per-rank offsets
+            # from _step_metadata, index-gather each rank's partial into a uniform
+            # [ep, prm, H] staging, equal-split a2a, LOCAL fp64 sum (order-free =>
+            # matches scoring's _rankgroup_fp64_combine bit-for-bit). NVLS dispatch
+            # transport untouched. prm = worst-case (2048) -> stable but ~1.8x combine
+            # tax; the bucket-sized variant (fp32rsv_v2.py) is the perf follow-up.
+            import torch.distributed as _d_dc
+            prm = self._per_rank_worst_case_token_count
+            H = rsv["tensor"].shape[1]
+            ep = self.ep_size
+            if not hasattr(self, "_nrl_dc_meta"):
+                dev = rsv["tensor"].device
+                self._nrl_dc_meta = torch.zeros(ep * 3, dtype=torch.int32, device=dev)
+                self._nrl_dc_stage = torch.empty(ep * prm, H, dtype=rsv["tensor"].dtype, device=dev)
+                self._nrl_dc_recv = torch.empty_like(self._nrl_dc_stage)
+                self._nrl_dc_ar = torch.arange(prm, device=dev, dtype=torch.int64)
+                print(f"[NRL_DET_COMBINE_XRANK] ZEROCERT exact combine ACTIVE (ep={ep} prm={prm})", flush=True)
+            _d_dc.all_gather_into_tensor(self._nrl_dc_meta, self.__class__._step_metadata, group=self.ep_group)
+            meta = self._nrl_dc_meta.view(ep, 3)
+            offs = meta[:, 1].to(torch.int64)
+            idx = (offs.view(ep, 1) + self._nrl_dc_ar.view(1, prm)).clamp_(0, rsv["tensor"].shape[0] - 1)
+            torch.index_select(rsv["tensor"], 0, idx.flatten(), out=self._nrl_dc_stage)
+            _d_dc.all_to_all_single(self._nrl_dc_recv, self._nrl_dc_stage, group=self.ep_group)
+            summed = self._nrl_dc_recv.view(ep, prm, H).to(torch.float64).sum(dim=0)
+            return summed[: self._local_tokens].to(torch.bfloat16)
         multimem_reduce_scatter_v(
             output,
             rsv["tensor"],

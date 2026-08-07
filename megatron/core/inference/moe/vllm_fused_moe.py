@@ -9,6 +9,8 @@ CUDA-graph compatible: all indirection table construction happens on-device
 via Triton kernels with fixed-size buffers and valid_tokens gating.
 """
 
+import os
+
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -19,6 +21,7 @@ from megatron.core.utils import null_decorator
 try:
     import triton
     import triton.language as tl
+    from torch._inductor.runtime.triton_helpers import libdevice as _nrl_libdevice
 
     HAVE_TRITON = True
 except ImportError:
@@ -29,6 +32,7 @@ if not HAVE_TRITON:
     triton.jit = null_decorator
     tl = MagicMock()
 
+from megatron.core.inference.moe.activations import bounded_silu_mul
 from megatron.core.inference.moe.fused_moe import ActivationType
 from megatron.core.inference.moe.permute import (
     _get_num_sms,
@@ -58,6 +62,25 @@ def _get_default_config(M: int, E: int, top_k: int) -> dict:
       2. Padding tax dominates at small M — the indirection table pads M-tiles
          per expert, so small M-tiles minimize wasted rows.
     """
+    # PATCH(det S2, NRL_FUSED_MOE_PIN_CONFIG=1): batch-invariant fixed config.
+    # The tile config being a step-function of M means the fp32 accumulation
+    # grouping (and hence the bf16 outputs) change with batch composition.
+    # Upstream vLLM's VLLM_BATCH_INVARIANT=1 pins this exact kernel to the
+    # constant below (fused_moe.py get_default_config); we mirror it verbatim.
+    if os.environ.get("NRL_FUSED_MOE_PIN_CONFIG", "0") == "1":
+        global _NRL_PIN_BANNER
+        if not globals().get("_NRL_PIN_BANNER"):
+            _NRL_PIN_BANNER = True
+            print("[NRL_FUSED_MOE_PIN] fused-MoE config PINNED (64/64/32/8)", flush=True)
+        return {
+            'BLOCK_SIZE_M': 64,
+            'BLOCK_SIZE_N': 64,
+            'BLOCK_SIZE_K': 32,
+            'GROUP_SIZE_M': 8,
+            'num_warps': 4,
+            'num_stages': 3,
+        }
+
     # BLOCK_SIZE_M: shrink at small M to limit per-expert padding waste.
     if M <= 32:
         block_m = 16
@@ -451,6 +474,7 @@ def _moe_sum_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
+    MUL_WEIGHT: tl.constexpr = True,
 ):
     """Reduce topk dimension with routing weight application.
 
@@ -482,16 +506,33 @@ def _moe_sum_kernel(
             offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
 
-            acc = tl.zeros([BLOCK_K], dtype=tl.float32)
-            for t in range(topk):
-                eid = tl.load(routing_map_ptr + token_id * topk + t)
-                lid = eid - local_expert_start
-                if lid >= 0 and lid < num_local_experts:
-                    v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
-                    w = tl.load(topk_weights_ptr + token_id * topk + t)
-                    acc += v.to(tl.float32) * w
-
-            tl.store(output_ptr + token_id_i64 * K + offs_k, acc, mask=k_mask)
+            if MUL_WEIGHT:
+                acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+                for t in range(topk):
+                    eid = tl.load(routing_map_ptr + token_id * topk + t)
+                    lid = eid - local_expert_start
+                    if lid >= 0 and lid < num_local_experts:
+                        v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
+                        w = tl.load(topk_weights_ptr + token_id * topk + t)
+                        acc += v.to(tl.float32) * w
+                tl.store(output_ptr + token_id_i64 * K + offs_k, acc, mask=k_mask)
+            else:
+                # PATCH(NRL_DET_INFOPT combine fix): probs already applied at the
+                # activation (TE placement). fp32 accumulation of bf16 addends is
+                # NOT always exact (fails when the addends' exponent spread needs
+                # >24 bits: the sum rounds and ADD ORDER matters -> rare 1-ulp
+                # cross-engine flips, the in-RL gen_kl residual). fp64 accumulation
+                # IS exact for any realistic spread -> the per-rank partial becomes
+                # order-independent; one cast to the fp32 output at the store.
+                acc64 = tl.zeros([BLOCK_K], dtype=tl.float64)
+                for t in range(topk):
+                    eid = tl.load(routing_map_ptr + token_id * topk + t)
+                    lid = eid - local_expert_start
+                    if lid >= 0 and lid < num_local_experts:
+                        v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
+                        acc64 += v.to(tl.float64)
+                tl.store(output_ptr + token_id_i64 * K + offs_k,
+                         acc64.to(tl.float32), mask=k_mask)
 
 
 def _moe_sum(
@@ -505,6 +546,7 @@ def _moe_sum(
     local_expert_start: int,
     num_local_experts: int,
     out: Optional[torch.Tensor] = None,
+    apply_weights: bool = True,
 ) -> torch.Tensor:
     """Fused topk reduction: [max_tokens*topk, K] bf16 → [max_tokens, K].
 
@@ -535,6 +577,70 @@ def _moe_sum(
         BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
         NUM_K_BLOCKS=NUM_K_BLOCKS,
+        MUL_WEIGHT=apply_weights,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# PATCH(NRL_DET_SWIGLU_DEVBOUND): device-bounded weighted swiglu.
+#
+# Bitwise-identical replacement for weighted_bias_swiglu_impl that skips the
+# garbage tail: the per-element instruction sequence is Inductor's emitted
+# Triton for that kernel (triton_poi_fused__to_copy_mul_silu_split_0), copied
+# VERBATIM — elementwise kernels have no cross-element reduction, so only the
+# per-element sequence determines bits; scheduling is bitwise-irrelevant.
+# The schedule is a persistent 1D grid (static launch → CUDA-graph-safe) that
+# strides while xoffset < a DEVICE element bound (= valid_tokens*topk*half_n,
+# the same device scalar the non-det bounded_silu_mul path uses — the flat
+# token-major layout makes the first valid_tokens*topk rows exactly the live
+# set, so no host-static-bound unsoundness applies). Certified bitwise 28/28
+# incl. NaN/Inf-poisoned garbage regions (job 2333121); 3.3x at decode-typical
+# live counts, 1.23x even fully live.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _nrl_weighted_swiglu_devbound_kernel(
+    in_ptr0, in_ptr1, out_ptr0, bound_ptr, xnumel, HALF_N: tl.constexpr, XBLOCK: tl.constexpr
+):
+    xbound = tl.load(bound_ptr)
+    num_progs = tl.num_programs(0)
+    xoffset = tl.program_id(0) * XBLOCK
+    while xoffset < xbound:
+        xindex = xoffset + tl.arange(0, XBLOCK)[:]
+        xmask = (xindex < xbound) & (xindex < xnumel)
+        # ---- Inductor's emitted per-element sequence, VERBATIM ----
+        x0 = (xindex % HALF_N)
+        x1 = xindex // HALF_N
+        x2 = xindex
+        tmp0 = tl.load(in_ptr0 + (x0 + 2 * HALF_N * x1), xmask).to(tl.float32)
+        tmp8 = tl.load(in_ptr0 + (HALF_N + x0 + 2 * HALF_N * x1), xmask).to(tl.float32)
+        tmp11 = tl.load(in_ptr1 + (x1), xmask, eviction_policy='evict_last')
+        tmp1 = tmp0.to(tl.float32)
+        tmp2 = -tmp1
+        tmp3 = _nrl_libdevice.exp(tmp2)
+        tmp4 = tl.full([1], 1.0, tl.float32)
+        tmp5 = tmp3 + tmp4
+        tmp6 = (tmp1 / tmp5)
+        tmp7 = tmp6.to(tl.float32)
+        tmp9 = tmp7 * tmp8
+        tmp10 = tmp9.to(tl.float32)
+        tmp12 = tmp10 * tmp11
+        tmp13 = tmp12.to(tl.float32)
+        tl.store(out_ptr0 + (x2), tmp13, xmask)
+        # ---- end verbatim ----
+        xoffset += num_progs * XBLOCK
+
+
+def _nrl_weighted_swiglu_devbound(y, w_flat, bound_elems, num_programs=1184, xblock=1024):
+    """y: [rows, 2*half_n] bf16; w_flat: [rows] fp32; bound_elems: device scalar
+    tensor = live_rows*half_n. Rows >= live are neither read nor written."""
+    rows, two_half_n = y.shape
+    half_n = two_half_n // 2
+    out = torch.empty(rows, half_n, dtype=y.dtype, device=y.device)
+    _nrl_weighted_swiglu_devbound_kernel[(num_programs,)](
+        y, w_flat, out, bound_elems, rows * half_n, HALF_N=half_n, XBLOCK=xblock
     )
     return out
 
@@ -621,7 +727,15 @@ def vllm_fused_moe(
     topk_weights_flat = probs.reshape(-1).contiguous()
 
     # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]
-    assert activation_type == ActivationType.SQUARED_RELU
+    # PATCH: gated SwiGLU support. SQUARED_RELU keeps the fused fp32 epilogue
+    # (elementwise → tile-local). SwiGLU pairs column c with c+N/2 across tiles,
+    # so it cannot fuse into the existing epilogue: run FC1 unfused to the
+    # 2N-wide intermediate, apply SiLU(gate)*up elementwise (upstream vLLM's
+    # silu_and_mul structure), then FC2 on the N/2-wide result. Rows for
+    # padding/non-local slots are undefined garbage in intermediate1 —
+    # harmless: their activation output is never read (_moe_sum skips them).
+    assert activation_type in (ActivationType.SQUARED_RELU, ActivationType.SWIGLU)
+    is_swiglu = activation_type == ActivationType.SWIGLU
     intermediate1 = torch.empty(
         num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
     )
@@ -637,8 +751,87 @@ def vllm_fused_moe(
         top_k=topk,
         config=config,
         grid_size=grid_size_fc1,
-        fuse_squared_relu=True,
+        fuse_squared_relu=not is_swiglu,
     )
+    import os as _os_det
+    _nrl_det = _os_det.environ.get("NRL_DET_INFOPT", "0") == "1"
+    if is_swiglu and _nrl_det:
+        # PATCH(NRL_DET_INFOPT, D5+D6): apply the routing probs AT the activation with
+        # the ACTUAL TE training kernel (weighted_bias_swiglu_impl) so the activation
+        # AND the prob placement are bitwise-identical to the TE scoring forward
+        # (reimplementations differ by jit-fuser FMA contraction — harness 2310960:
+        # best recipe 99.9995%, not 100%). Processes all num_valid rows incl. garbage
+        # rows — they are never read downstream (fc2/_moe_sum skip non-local slots).
+        from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+        if not globals().get("_NRL_DET_BANNER"):
+            globals()["_NRL_DET_BANNER"] = True
+            print("[NRL_DET_INFOPT] TE weighted-swiglu at activation + unweighted exact "
+                  "fp32 combine ACTIVE (vllm_fused_moe_det)", flush=True)
+        # PATCH(det swiglu bucket-bound): the NVLS worst-case views hand this kernel
+        # max_tokens*topk rows (16k+ rows, 95us flat, 17.7% of GPU time) but only
+        # rows < valid_tokens*topk are ever read downstream (fc2/_moe_sum gate by
+        # sorted ids < valid). Bound to the bucket's token count (num_tokens_hint,
+        # host int -> static slice per captured graph; = live count in eager).
+        # Bit-identical for live rows: the kernel is row-local.
+        # SAFETY (det-bed NaN post-mortem): num_tokens_hint is the EXPECTED count
+        # (tile-selection hint), NOT an upper bound — slicing by it on eager calls
+        # can drop live rows (fc2 then reads uninitialized memory -> garbage/NaN
+        # logprobs with coherent text). Under graph CAPTURE, max_tokens IS the
+        # bucket size (exact static bound), so slice there; eager calls run full.
+        import builtins as _bi_det
+        _in_graph_ctx = (torch.cuda.is_current_stream_capturing()
+                         or getattr(_bi_det, "_NRL_GRAPH_WARMUP", False))
+        # DEFAULT OFF: the slice bounds EXPERT-side (token,expert) rows by a TOKEN-side
+        # quantity; routing imbalance puts a hot rank's live rows above hint*topk ->
+        # live rows dropped -> degraded hidden states (RL small-bed regression:
+        # gen_kl 0.0019 -> 0.31, reward 0.166 -> 0.023). No host-static bound is
+        # universally safe for this row space. Opt-in for single-stream benches only.
+        _bound_on = _os_det.environ.get("NRL_DET_SWIGLU_BOUND", "0") == "1"
+        # PATCH(NRL_DET_SWIGLU_DEVBOUND): sound successor to the retracted host
+        # bound above — bounds by the DEVICE scalar valid_tokens*topk (the true
+        # live count in the flat token-major layout; identical to what the
+        # non-det bounded_silu_mul branch below uses), with Inductor's per-
+        # element instruction sequence verbatim (bitwise-certified, 2333121).
+        # Static persistent launch → CUDA-graph-safe in eager, warmup, capture.
+        if _os_det.environ.get("NRL_DET_SWIGLU_DEVBOUND", "0") == "1":
+            if not globals().get("_NRL_DEVB_BANNER"):
+                globals()["_NRL_DEVB_BANNER"] = True
+                print("[NRL_DET_INFOPT] device-bounded det-swiglu ACTIVE "
+                      "(valid_tokens-gated, Inductor-verbatim)", flush=True)
+            _bound_elems = valid_tokens.to(torch.int64) * (
+                topk * (intermediate1.shape[1] // 2)
+            )
+            intermediate1 = _nrl_weighted_swiglu_devbound(
+                intermediate1, topk_weights_flat, _bound_elems
+            )
+        elif _bound_on and _in_graph_ctx and num_tokens_hint is not None:
+            # warmup-eager runs the SAME sliced shape so torch.compile/Inductor
+            # autotunes BEFORE capture (autotune inside capture = sync = crash)
+            # At capture the hint IS the graph bucket's token count (exact), and
+            # replayed steps have valid_tokens <= bucket by construction — an exact
+            # static bound. (max_tokens here is the NVLS worst-case VIEW size, so
+            # bounding by it is a no-op — hence hint, not max_tokens.)
+            _n_bound = num_tokens_hint * topk
+            _n_bound = min(_n_bound, num_valid)
+            intermediate1 = weighted_bias_swiglu_impl(
+                intermediate1[:_n_bound], None,
+                topk_weights_flat[:_n_bound].unsqueeze(-1), False
+            )
+        else:
+            intermediate1 = weighted_bias_swiglu_impl(
+                intermediate1, None, topk_weights_flat.unsqueeze(-1), False
+            )
+    elif is_swiglu:
+        # gate = first half, up = second half (megatron chunk convention).
+        # Device-bounded Triton kernel instead of torch silu*mul: the torch version
+        # processes ALL num_valid rows, which under the NVLS dispatcher's worst-case
+        # views is max_tokens*topk = global_max*topk rows (~1GB traffic twice per
+        # layer, profiled at 25ms/step = 73% on Qwen3-30B BS256). Only rows
+        # < valid_tokens*topk are live (flat token-major layout); the bounded kernel
+        # reads that limit from the device scalar, so work tracks the real token
+        # count inside CUDA graphs with no packing/lockstep assumptions.
+        n_rows = (valid_tokens * topk).to(torch.int32)
+        intermediate1 = bounded_silu_mul(intermediate1, n_rows)
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], without routing weights.
     # Routing weights are applied in the reduction kernel to avoid an extra
@@ -662,6 +855,29 @@ def vllm_fused_moe(
         grid_size=grid_size_fc2,
     )
 
+    # PATCH(NRL_MOE_DUMP): stage dump for the cross-engine MoE bisect (rank 0,
+    # prefill-like calls only; call n == layer index in the single prefill pass).
+    _md = _os_det.environ.get("NRL_MOE_DUMP", "")
+    if _md and not torch.cuda.is_current_stream_capturing():
+        _rk = _os_det.environ.get("RANK", "0")
+        _st = globals().setdefault("_NRL_MOE_DUMP_ST", {"n": 0})
+        _hs = hidden_states
+        _pf = (_hs.shape[0] >= 25 and not bool(torch.isnan(_hs[:2]).any())
+               and not bool((_hs[0] == _hs[1]).all()))
+        if _pf and _st["n"] < 4:
+            # K2v3: widened to 512 rows for cross-engine row-hash matching
+            _nk = min(512, _hs.shape[0])
+            _nr = _nk * topk
+            torch.save({
+                "n": _st["n"], "local_expert_start": local_expert_start,
+                "num_local_experts": num_local_experts,
+                "hs": _hs[:_nk].detach().float().cpu().clone(),
+                "probs": probs[:_nk].detach().float().cpu().clone(),
+                "rmap": routing_map[:_nk].detach().cpu().clone(),
+                "i1": intermediate1[:_nr].detach().float().cpu().clone(),
+                "i3": intermediate3[:_nr].detach().float().cpu().clone(),
+            }, _md + f"/moeA_{_st['n']}_r{_rk}.pt")
+            _st["n"] += 1
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
     # Applies routing weights and accumulates in fp32, writes directly to
     # out (if provided), zeros rows beyond valid_tokens, and skips non-local
@@ -677,4 +893,5 @@ def vllm_fused_moe(
         local_expert_start,
         num_local_experts,
         out=out,
+        apply_weights=not _nrl_det,
     )

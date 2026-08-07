@@ -12,6 +12,7 @@ import torch
 
 from megatron.core.inference.moe.activations import (
     padded_squared_relu,
+    padded_swiglu,
     squared_relu_and_quantize_mxfp8,
 )
 from megatron.core.inference.moe.permute import (
@@ -42,6 +43,7 @@ class ActivationType(Enum):
     """Activation functions supported by mcore_fused_moe."""
 
     SQUARED_RELU = "squared_relu"
+    SWIGLU = "swiglu"  # PATCH: gated SwiGLU (SiLU(gate)*up)
 
 
 def _bf16_grouped_mm(
@@ -75,6 +77,10 @@ def _get_activation_func(activation_type: ActivationType, fused_quant: bool = Fa
     """
     if activation_type == ActivationType.SQUARED_RELU:
         return squared_relu_and_quantize_mxfp8 if fused_quant else padded_squared_relu
+    elif activation_type == ActivationType.SWIGLU:  # PATCH: gated SwiGLU support
+        if fused_quant:
+            raise NotImplementedError("SWIGLU + MXFP8 fused-quant not implemented (bf16 only)")
+        return padded_swiglu
     else:
         raise ValueError(f"Unsupported activation type: {activation_type}")
 
@@ -177,6 +183,22 @@ def mcore_fused_moe(
     # produces MXFP8Tensor directly).
     if use_mxfp8 and not isinstance(hidden_states, MXFP8Tensor):
         hidden_states = MXFP8Tensor.from_bf16(hidden_states, backend="triton")
+    import os as _os
+    if _os.environ.get("NRL_DEBUG_FC1"):
+        try:
+            _w = fc1_weight.data if hasattr(fc1_weight, "data") else fc1_weight
+            _o = offs
+            _vt = int(valid_tokens) if (hasattr(valid_tokens, "numel") and valid_tokens.numel() == 1) else -1
+            _out_sz = max_tokens * min(routing_map.shape[1], num_local_experts) + expert_alignment * num_local_experts
+            print(f"[FC1DBG] permuted_rows={hidden_states.shape[0]} computed_output_size={_out_sz} "
+                  f"max_tokens={max_tokens} valid_tokens={_vt} routing_map={tuple(routing_map.shape)} "
+                  f"offs_n={int(_o.numel())} offs_min={int(_o.min())} offs_max={int(_o.max())} offs_last={int(_o[-1])} "
+                  f"OVERFLOW_vs_permuted_rows={'YES' if int(_o.max())>hidden_states.shape[0] else 'no'} "
+                  f"num_local_experts={num_local_experts} align={expert_alignment}", flush=True)
+            import torch as _t; _t.cuda.synchronize()
+            print("[FC1DBG] pre-FC1 sync OK", flush=True)
+        except Exception as _e:
+            print("[FC1DBG] err", _e, flush=True)
     fc1_output = mm_fn(hidden_states, fc1_weight, offs)
 
     # offs[-1:] is a 1-element view pointing to inclusive_expert_offsets[-1] — the total

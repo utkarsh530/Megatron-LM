@@ -63,8 +63,23 @@ def get_moe_module_spec_for_backend(
     shared_experts = partial(SharedExpertMLP, submodules=mlp)
 
     # MoE module spec
+    # PATCH(inference-router): the GPT inference_optimized path reaches here via
+    # get_gpt_layer_with_inference_submodules with backend=InferenceSpecProvider, but no
+    # router is set, so MoESubmodules falls back to the training TopKRouter (dense
+    # [tokens, num_experts] bool output). get_inference_optimized_moe_spec below wires
+    # router=InferenceTopKRouter (compact [tokens, topk] indices — what the fused-MoE
+    # path and the AGV/permute kernels expect) and its docstring says it is called by
+    # gpt_layer_specs.py, but only hybrid_layer_specs.py ever calls it. This missing
+    # kwarg is the root cause of the dense-routing feed (permute IMA, NVLS "128 vs 8")
+    # on GPT MoE models. Mirror the hybrid path's router here.
+    submodule_kwargs = {}
+    if isinstance(backend, InferenceSpecProvider):
+        submodule_kwargs["router"] = InferenceTopKRouter
     return partial(
-        MoELayer, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
+        MoELayer,
+        submodules=MoESubmodules(
+            experts=experts, shared_experts=shared_experts, **submodule_kwargs
+        ),
     )
 
 
