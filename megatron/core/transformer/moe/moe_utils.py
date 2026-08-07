@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -429,6 +430,289 @@ def permute(
     return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
 
 
+
+# PATCH(det fixed-order combine): NRL_FIXED_ORDER_MOE_COMBINE gates + impls,
+# ported verbatim from the v0.5.0 determinism tree (see moe_combine_deepdive.md).
+def _use_deterministic_moe_paths() -> bool:
+    """NeMo-RL MoE-only determinism knob (no global ``torch.use_deterministic_algorithms``).
+
+    Opt-in only: set ``NRL_FIXED_ORDER_MOE_COMBINE=1`` (default off). Dense models never
+    call these code paths. When enabled, selects in ``moe_utils`` only:
+    - ``unpermute``: fixed-order ``[T, max_slots, H].sum(1)`` instead of ``scatter_add_``
+    - ``topk_softmax_with_capacity``: ``index_put_`` instead of ``scatter`` for routing maps
+
+    Megatron ``--deterministic-mode`` still sets the global torch flag separately.
+    """
+    return os.environ.get("NRL_FIXED_ORDER_MOE_COMBINE", "0") == "1"
+
+
+def _combine_impl() -> str:
+    """Select the deterministic-combine implementation (only active when the fixed-order
+    combine is enabled via ``NRL_FIXED_ORDER_MOE_COMBINE=1``). For test/ablation:
+
+    - ``padded``    (default): ``[T, max_slots, H]`` dense buffer + ``index_put`` + ``.sum(1)``
+                    (original ``_unpermute_fixed_order_combine``; byte-for-byte unchanged behavior).
+    - ``segmented``: argsort/group then a deterministic segmented sum over the sorted rows
+                    (no dense ``[T, max_slots, H]`` buffer / no accumulating ``index_put``).
+    - ``gather``   : standard top-k only — build the inverse ``[T, top_k]`` index from the
+                    routing structure (no argsort) and ``gather -> [T, top_k, H].sum(1)``;
+                    falls back to ``segmented`` for ``drop_and_pad`` / non-uniform top-k.
+
+    All three are deterministic (fixed reduction order). gen<->train consistency holds because the
+    same impl is used in both the generation and training/logprob forwards.
+    """
+    impl = os.environ.get("NRL_COMBINE_IMPL", "padded").strip().lower()
+    return impl if impl in ("padded", "segmented", "gather") else "padded"
+
+
+def _combine_gather_droppad() -> bool:
+    """Opt-in (default off): when ``NRL_COMBINE_GATHER_DROPPAD=1`` AND ``NRL_COMBINE_IMPL=gather``,
+    extend the no-argsort gather combine to the ``drop_and_pad`` path (generation / cuda-graph
+    inference). Without it, ``drop_and_pad`` falls back to the sort-based ``segmented`` combine.
+    This is the lever for the GENERATION-side det tax: the gen combine runs once per decode token
+    under drop_and_pad, so removing its radix sort here kills the dominant launch-bound cost.
+    """
+    return os.environ.get("NRL_COMBINE_GATHER_DROPPAD", "0") == "1"
+
+
+def _segment_sum(vals: torch.Tensor, group_sizes: torch.Tensor) -> torch.Tensor:
+    """Deterministic per-segment sum of contiguous row groups. ``vals`` is [N, H] sorted so that
+    rows of group g are contiguous; ``group_sizes`` [G] gives each group's length (sum == N).
+    Returns [G, H]. No atomics -> deterministic."""
+    # Accumulate in fp32 (parity with torch.sum's fp32 accumulation in the padded path), cast back.
+    vf = vals.float()
+    seg_fn = getattr(torch, "segment_reduce", None)
+    if seg_fn is not None:
+        try:
+            return seg_fn(vf, "sum", lengths=group_sizes, axis=0, unsafe=True).to(vals.dtype)
+        except Exception:
+            pass
+    # Fallback: prefix-sum difference in fp32 (sequential -> deterministic).
+    n, h = vals.shape
+    csum = torch.zeros(n + 1, h, dtype=torch.float32, device=vals.device)
+    torch.cumsum(vf, dim=0, out=csum[1:])
+    ends = group_sizes.cumsum(0)
+    starts = ends - group_sizes
+    return (csum[ends] - csum[starts]).to(vals.dtype)
+
+
+def _unpermute_fixed_order_combine(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    restore_shape: torch.Size,
+) -> torch.Tensor:
+    """Sum expert outputs per token in stable (permute) order via [T, max_slots, H].sum(1).
+
+    Avoids atomic ``scatter_add_`` / ``index_add_``. Works for standard top-k routing and
+    for decode ``drop_and_pad`` (variable rows per token; ``max_slots`` from group sizes).
+    """
+    num_tokens, hidden = restore_shape
+    num_permuted = permuted_tokens.size(0)
+    if num_permuted == 0:
+        return torch.zeros(restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device)
+
+    sort_perm = torch.argsort(sorted_indices, stable=True)
+    dest = sorted_indices[sort_perm]
+    vals = permuted_tokens[sort_perm]
+
+    seq = torch.arange(num_permuted, device=permuted_tokens.device, dtype=torch.long)
+    if num_permuted > 1:
+        change = dest.new_ones(num_permuted, dtype=torch.bool)
+        change[1:] = dest[1:] != dest[:-1]
+    else:
+        change = dest.new_ones(1, dtype=torch.bool)
+    group_id = change.long().cumsum(0) - 1
+    num_groups = int(group_id[-1].item()) + 1
+    group_sizes = torch.bincount(group_id, minlength=num_groups)
+    starts = torch.zeros(num_groups, dtype=torch.long, device=permuted_tokens.device)
+    if num_groups > 1:
+        starts[1:] = group_sizes.cumsum(0)[:-1]
+    slot = seq - starts[group_id]
+    max_slots = int(group_sizes.max().item())
+
+    contrib = torch.zeros(
+        num_tokens, max_slots, hidden, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+    )
+    contrib[dest, slot] = vals
+    return contrib.sum(dim=1)
+
+
+def _unpermute_segmented_combine(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    restore_shape: torch.Size,
+) -> torch.Tensor:
+    """Step A: deterministic combine via segmented sum (no dense ``[T, max_slots, H]`` buffer).
+
+    Same fixed reduction order as ``_unpermute_fixed_order_combine`` (sort by destination token,
+    sum each token's contiguous run), but the per-token reduction is a segmented sum written
+    directly to ``[T, H]`` -- avoiding the padded 3D buffer and the accumulating ``index_put``.
+    Handles standard top-k and decode ``drop_and_pad`` (variable rows/token). Deterministic.
+    """
+    num_tokens, hidden = restore_shape
+    num_permuted = permuted_tokens.size(0)
+    out = torch.zeros(num_tokens, hidden, dtype=permuted_tokens.dtype, device=permuted_tokens.device)
+    if num_permuted == 0:
+        return out
+
+    sort_perm = torch.argsort(sorted_indices, stable=True)
+    dest = sorted_indices[sort_perm]
+    vals = permuted_tokens[sort_perm]
+
+    if num_permuted > 1:
+        change = dest.new_ones(num_permuted, dtype=torch.bool)
+        change[1:] = dest[1:] != dest[:-1]
+    else:
+        change = dest.new_ones(1, dtype=torch.bool)
+    group_id = change.long().cumsum(0) - 1
+    num_groups = int(group_id[-1].item()) + 1
+    group_sizes = torch.bincount(group_id, minlength=num_groups)
+    unique_dest = dest[change]  # [num_groups]: the destination token id of each contiguous group
+
+    seg = _segment_sum(vals, group_sizes)  # [num_groups, H], deterministic
+    out[unique_dest] = seg.to(out.dtype)  # unique indices -> no accumulation, deterministic
+    return out
+
+
+def _unpermute_gather_combine(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    restore_shape: torch.Size,
+    routing_map: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Step B: standard top-k combine with NO argsort. Build the inverse ``[T, top_k]`` index from
+    the routing structure (permute is expert-major, token-ascending within expert):
+    ``pos(t, e) = expert_offset[e] + (#tokens < t routed to e)``. Gather -> ``[T, top_k, H].sum(1)``.
+
+    ``top_k`` is static (no ``max_slots`` / ``.item()`` syncs) and there is no sort. Requires a
+    ``routing_map`` [T, E] with a uniform number of experts per token (standard routing); callers
+    must fall back to ``_unpermute_segmented_combine`` for ``drop_and_pad`` / non-uniform routing.
+    Deterministic (fixed gather + fixed sum order).
+    """
+    num_tokens, hidden = restore_shape
+    rmap = routing_map.bool()  # [T, E]
+    # within-expert rank of each (token, expert), valid where rmap is True
+    within = rmap.long().cumsum(dim=0) - 1  # [T, E]
+    expert_counts = rmap.long().sum(dim=0)  # [E]
+    expert_offset = torch.zeros_like(expert_counts)
+    expert_offset[1:] = expert_counts.cumsum(0)[:-1]
+    pos = expert_offset.unsqueeze(0) + within  # [T, E]: position in permuted array of (t, e)
+    # select the valid positions in (token-major, expert-ascending) order -> exactly top_k per token
+    pos_sel = pos[rmap]  # [T * top_k]
+    # Safety: gather assumes a uniform experts-per-token (so [T*top_k] reshapes to [T, top_k]).
+    # If routing is ragged (non-uniform), fall back to the sort-based segmented combine.
+    if num_tokens == 0 or pos_sel.numel() % num_tokens != 0:
+        return _unpermute_segmented_combine(permuted_tokens, sorted_indices, restore_shape)
+    gathered = permuted_tokens.index_select(0, pos_sel)  # [T*top_k, H]
+    if os.environ.get("NRL_COMBINE_RANKGROUP_FP64", "0") == "1":
+        expert_ids = pos.new_zeros(0)  # expert id per selected slot, ascending order
+        expert_ids = torch.arange(rmap.size(1), device=rmap.device).unsqueeze(0).expand_as(rmap)[rmap]
+        return _rankgroup_fp64_combine(gathered.view(num_tokens, -1, hidden),
+                                       expert_ids.view(num_tokens, -1), rmap.size(1))
+    return gathered.view(num_tokens, -1, hidden).sum(dim=1)  # [T, H], fixed-order sum over top_k
+
+
+def _unpermute_gather_combine_droppad(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    restore_shape: torch.Size,
+    routing_map: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Step B for the ``drop_and_pad`` (generation / cuda-graph inference) path — NO argsort.
+
+    In drop_and_pad each expert owns a fixed ``capacity`` block, so the permuted buffer is
+    ``[E*capacity, H]`` and a kept token ``t`` routed to expert ``e`` sits at
+    ``pos(t, e) = e*capacity + rank(t, e)`` where ``rank`` is its token-ascending order within ``e``
+    (a ``cumsum``, not a sort). ``routing_map`` [T, E] still carries exactly ``top_k`` trues per row
+    (drops happen in permute's ``[:capacity]`` truncation, not in routing_map), so the gather stays a
+    uniform ``[T, top_k]``; entries with ``rank >= capacity`` were dropped and are masked to 0
+    (matching the current path, where dropped/padding slots contribute 0). Deterministic.
+    """
+    num_tokens, hidden = restore_shape
+    rmap = routing_map.bool()  # [T, E], exactly top_k trues per row
+    num_experts = rmap.size(1)
+    total_slots = permuted_tokens.size(0)
+    if num_experts == 0 or total_slots % num_experts != 0:
+        return _unpermute_segmented_combine(permuted_tokens, sorted_indices, restore_shape)
+    capacity = total_slots // num_experts
+    rank = rmap.long().cumsum(dim=0) - 1  # [T, E]: token-ascending rank within each expert
+    expert_base = torch.arange(num_experts, device=rmap.device) * capacity  # [E]
+    pos = expert_base.unsqueeze(0) + rank  # [T, E]: slot in the [E*capacity] buffer
+    # PATCH(capture-safe gatherdp): boolean-mask selection (pos[rmap]) calls nonzero()
+    # -> host sync -> illegal under CUDA graph capture. routing_map has exactly top_k
+    # trues per row, so extract the selected experts with a static-shape per-row sort
+    # (trues get keys 0..E-1, falses get E+col -> first top_k sorted entries are the
+    # selected experts in ascending-expert order, matching the mask-select order).
+    sel_key = torch.where(
+        rmap,
+        torch.arange(num_experts, device=rmap.device).unsqueeze(0).expand_as(rmap),
+        num_experts + torch.arange(num_experts, device=rmap.device).unsqueeze(0).expand_as(rmap),
+    )
+    expert_idx_sorted = sel_key.sort(dim=1).values  # [T, E], first entries = selected experts
+    # top_k is uniform per row and static per model; resolve once during eager warmup
+    # (pre-capture) and cache on the function.
+    _tk = getattr(_unpermute_gather_combine_droppad, "_nrl_static_topk", None)
+    if _tk is None:
+        _tk = int(rmap[0].sum().item()) if num_tokens > 0 else 0  # one-time host sync, pre-capture
+        _unpermute_gather_combine_droppad._nrl_static_topk = _tk
+    if _tk == 0:
+        return _unpermute_segmented_combine(permuted_tokens, sorted_indices, restore_shape)
+    expert_idx = expert_idx_sorted[:, :_tk]  # [T, top_k] ascending expert ids
+    pos_sel = torch.gather(pos, 1, expert_idx)  # [T, top_k]
+    keep_sel = torch.gather(rank, 1, expert_idx) < capacity  # [T, top_k]
+    if os.environ.get("NRL_DROP_TRACE", "0") == "1":
+        _drops = int((~keep_sel).sum().item())
+        if _drops:
+            _c = getattr(_unpermute_gather_combine_droppad, "_nrl_drop_calls", 0)
+            if _c < 40:
+                _unpermute_gather_combine_droppad._nrl_drop_calls = _c + 1
+                print(f"[NRL_DROP] dropped={_drops}/{keep_sel.numel()} slots "
+                      f"(T={num_tokens}, capacity={capacity})", flush=True)
+    pos_safe = torch.where(keep_sel, pos_sel, torch.zeros_like(pos_sel))
+    gathered = permuted_tokens.index_select(0, pos_safe.reshape(-1))  # [T*top_k, H]
+    gathered = gathered * keep_sel.reshape(-1).unsqueeze(-1).to(gathered.dtype)
+    if os.environ.get("NRL_COMBINE_RANKGROUP_FP64", "0") == "1":
+        return _rankgroup_fp64_combine(gathered.view(num_tokens, -1, hidden),
+                                       expert_idx, num_experts)
+    return gathered.view(num_tokens, -1, hidden).sum(dim=1)  # [T, H]
+
+
+def _rankgroup_fp64_combine(gathered: torch.Tensor, expert_ids: torch.Tensor,
+                            num_experts: int) -> torch.Tensor:
+    """PATCH(NRL_COMBINE_RANKGROUP_FP64): emulate the engine's combine tree so the
+    two engines execute the same arithmetic on rare-spread values.
+
+    Engine tree (det infopt): per-EP-rank fp64-exact partial over that rank's
+    local experts (_moe_sum acc64) -> cast fp32 -> cross-rank fp32 reduction.
+    Scoring emulation: group the [T, top_k, H] gathered expert outputs by the
+    hosting EP rank (expert_id // experts_per_rank), fp64 partial per rank
+    (order-free: fp64 sum of <=top_k bf16 addends is exact), cast fp32,
+    rank-ascending fp32 sum, one terminal cast to the input dtype.
+    """
+    import megatron.core.parallel_state as _ps
+    ep = getattr(_rankgroup_fp64_combine, "_nrl_ep", None)
+    if ep is None:
+        try:
+            ep = _ps.get_expert_model_parallel_world_size()
+        except Exception:
+            ep = 1
+        _rankgroup_fp64_combine._nrl_ep = ep
+        print(f"[NRL_COMBINE_RANKGROUP_FP64] ACTIVE: ep={ep} "
+              f"experts_per_rank={num_experts // max(ep, 1)}", flush=True)
+    per_rank = max(num_experts // max(ep, 1), 1)
+    rank_of = (expert_ids // per_rank)  # [T, top_k]
+    g64 = gathered.to(torch.float64)  # [T, top_k, H]
+    total = None
+    for r in range(max(ep, 1)):  # per-rank fp64-exact partial -> fp32 (engine cast)
+        m = (rank_of == r).unsqueeze(-1).to(torch.float64)
+        partial = (g64 * m).sum(dim=1).to(torch.float32)
+        # cross-rank accumulate in fp64 (exact => order-independent), matching the
+        # engine's det a2a+fp64 combine; single terminal cast below
+        p64 = partial.to(torch.float64)
+        total = p64 if total is None else total + p64
+    return total.to(gathered.dtype)
+
+
 def unpermute(
     permuted_tokens: torch.Tensor,
     sorted_indices: torch.Tensor,
@@ -468,6 +752,13 @@ def unpermute(
         torch.Tensor: The tokens restored to their original order.
     """
     if fused:
+        # PATCH(det fixed-order combine): the fused TE unpermute bypasses the fixed-order
+        # combine; determinism requires the eager path.
+        if _use_deterministic_moe_paths():
+            raise ValueError(
+                "NRL_FIXED_ORDER_MOE_COMBINE=1 requires the eager unpermute; set "
+                "policy.megatron_cfg.moe_permute_fusion=false."
+            )
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
         extra_kwargs = {}
@@ -510,16 +801,46 @@ def unpermute(
         # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
+    # PATCH(det fixed-order combine): fixed-order deterministic combine, ported from the
+    # v0.5.0 determinism tree (gate NRL_FIXED_ORDER_MOE_COMBINE, impl NRL_COMBINE_IMPL).
+    if _use_deterministic_moe_paths():
+        global _NRL_DET_COMBINE_BANNER
+        if not globals().get("_NRL_DET_COMBINE_BANNER"):
+            _NRL_DET_COMBINE_BANNER = True
+            print(
+                f"[NRL_DET_COMBINE] fixed-order combine ACTIVE impl={_combine_impl()} "
+                f"droppad={_combine_gather_droppad()}",
+                flush=True,
+            )
+        impl = _combine_impl()
+        if impl == "gather" and routing_map is not None and not drop_and_pad:
+            output_tokens = _unpermute_gather_combine(
+                permuted_tokens, sorted_indices, restore_shape, routing_map
+            )
+        elif (
+            impl == "gather"
+            and drop_and_pad
+            and routing_map is not None
+            and _combine_gather_droppad()
+        ):
+            output_tokens = _unpermute_gather_combine_droppad(
+                permuted_tokens, sorted_indices, restore_shape, routing_map
+            )
+        elif impl in ("segmented", "gather"):
+            output_tokens = _unpermute_segmented_combine(
+                permuted_tokens, sorted_indices, restore_shape
+            )
+        else:  # "padded"
+            output_tokens = _unpermute_fixed_order_combine(
+                permuted_tokens, sorted_indices, restore_shape
+            )
+        return output_tokens.to(dtype=input_dtype)
+
     # Create an output tensor filled with zeros
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
     if torch.are_deterministic_algorithms_enabled():
-        # Use index_add which is deterministic when deterministic algorithms are enabled
-        # and is CUDA graph compatible
-        output_tokens = torch.zeros(
-            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-        )
         # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
         # and is CUDA graph compatible unlike scatter_add
         output_tokens.index_add_(0, sorted_indices, permuted_tokens)
@@ -954,7 +1275,11 @@ def apply_router_token_dropping(
 
     # Apply capacity constraints
     if pad_to_capacity:
-        final_map = capacity_mask
+        # PATCH(golden, upstream #9): capacity_mask alone dispatches EVERY token to
+        # EVERY expert when capacity >= num_tokens (drop-free factor) — a [T,E]
+        # all-true map instead of top-k. Intersect with routing_map exactly like
+        # the non-pad branch so padding pads SLOTS, not routing.
+        final_map = torch.logical_and(routing_map, capacity_mask)
         final_probs = routing_probs * final_map
     else:
         # Get exceed mask and maskout exceeded probs and indices
@@ -1268,6 +1593,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
 
         if te_general_gemm is not None and router_dtype != torch.float64:
             output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
+            _nrl_maybe_dump_router_logits(output[0] if isinstance(output, (list, tuple)) else output)
             output = output[0]
         elif bias is None:
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
@@ -1315,6 +1641,45 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
         return grad_input, grad_weight, grad_bias, None
+
+
+
+# PATCH(det router-logit dump): NRL_DUMP_ROUTER_LOGITS=<dir> dumps fp32 router logits
+# for PREFILL-SIZED calls (>=256 rows) to <dir>/r<rank>_pass<p>_l<layer>.npy. Calls are
+# layer-ordered within a forward pass; a pass rolls over every 48 calls.
+_NRL_RLD_STATE = {"pass": 0, "call": 0}
+
+
+def _nrl_maybe_dump_router_logits(logits):
+    import os as _os
+
+    d = _os.environ.get("NRL_DUMP_ROUTER_LOGITS", "")
+    if not d:
+        return
+    # NRL_DUMP_RL_ALL=1: also dump decode-sized calls (default: prefill-only >=256 rows),
+    # capped by NRL_DUMP_MAX_CALLS to bound IO for P2 (decode-vs-prefill) localization.
+    if _os.environ.get("NRL_DUMP_RL_ALL", "0") == "1":
+        if _NRL_RLD_STATE["call"] >= int(_os.environ.get("NRL_DUMP_MAX_CALLS", "3000")):
+            return
+    elif logits.shape[0] < 256:
+        return
+    import numpy as _np
+    import torch as _t
+
+    st = _NRL_RLD_STATE
+    layer = st["call"] % 48
+    if layer == 0 and st["call"] > 0:
+        st["pass"] += 1
+    st["call"] += 1
+    try:
+        r = _t.distributed.get_rank() if _t.distributed.is_initialized() else 0
+        _os.makedirs(d, exist_ok=True)
+        _np.save(
+            f"{d}/r{r}_pass{st['pass']}_l{layer}.npy",
+            logits.detach().float().cpu().numpy(),
+        )
+    except Exception as e:
+        print(f"[NRL_RLD] dump failed: {e}", flush=True)
 
 
 def router_gating_linear(

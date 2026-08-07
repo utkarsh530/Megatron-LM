@@ -4,6 +4,28 @@ from abc import ABC, abstractmethod
 from typing import Optional, Union
 
 import torch
+import os as _os_ld
+_NRL_LD_STATE = {"buf": [], "n": 0, "banner": False}
+
+# PATCH(NRL_BATCH_INVARIANT standalone hook): the NeMo-RL worker enables the fork's
+# batch-invariant kernels in setup.py; standalone servers/scripts never run that hook.
+# This module is imported during model build in BOTH engines (mounted over router.py),
+# so enable here, env-gated, before any forward.
+if _os_ld.environ.get("NRL_BATCH_INVARIANT", "0") == "1":
+    try:
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            enable_batch_invariant_mode as _nrl_ebi,
+        )
+        _nrl_ebi()
+        import sys as _sys_ld
+        # stderr: import-time stdout pollutes Makefile $(shell python ...) flag capture
+        print("[NRL_BATCH_INVARIANT] BI kernels ENABLED (router import hook, "
+              f"NRL_BI_KERNELS={_os_ld.environ.get('NRL_BI_KERNELS', 'all')})",
+              file=_sys_ld.stderr, flush=True)
+    except Exception as _e:
+        import sys as _sys_ld
+        print(f"[NRL_BATCH_INVARIANT] enable FAILED: {_e}", file=_sys_ld.stderr, flush=True)
+
 
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
@@ -215,8 +237,17 @@ class TopKRouter(Router):
             self.ga_steps = None
 
         self.router_replay = None
-        if self.config.moe_enable_routing_replay:
+        # PATCH(golden-replication): megatron-bridge's provider->config conversion
+        # drops the moe_enable_routing_replay attr set by NeMo-RL setup.py, so the
+        # constructed config reverts to the dataclass default (False) and no
+        # recorder is created. NRL_FORCE_ROUTING_REPLAY=1 restores the intent.
+        import os as _os_rr
+        if self.config.moe_enable_routing_replay or _os_rr.environ.get("NRL_FORCE_ROUTING_REPLAY", "0") == "1":
+            self.config.moe_enable_routing_replay = True
             self.router_replay = RouterReplay()
+            if not getattr(RouterReplay, "_nrl_force_banner", False):
+                RouterReplay._nrl_force_banner = True
+                print("[NRL_FORCE_REPLAY] RouterReplay recorder created (env-forced)", flush=True)
 
     def _maintain_float32_expert_bias(self):
         """
@@ -613,6 +644,22 @@ class TopKRouter(Router):
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        # PATCH(NRL_LOGIT_DUMP): TE/training-path router logit dump (same format as the
+        # InferenceTopKRouter hook; rows are sequence-ordered in a teacher-forced forward).
+        _dump_dir = _os_ld.environ.get("NRL_LOGIT_DUMP", "")
+        if _dump_dir and _os_ld.environ.get("RANK", "0") == "0" and not torch.cuda.is_current_stream_capturing():
+            _st = _NRL_LD_STATE
+            if not _st["banner"]:
+                _st["banner"] = True
+                print(f"[NRL_LOGIT_DUMP] ACTIVE (TopKRouter) -> {_dump_dir}", flush=True)
+            _l2 = logits.reshape(-1, logits.shape[-1])
+            _st["buf"].append(
+                (int(getattr(self, "layer_number", -1)), int(_l2.shape[0]),
+                 _l2[: min(_l2.shape[0], 256)].detach().float().cpu().clone())
+            )
+            _st["n"] += 1
+            if _st["n"] % 48 == 0:
+                torch.save(_st["buf"], _dump_dir + "/logits_rank0.pt")
         """Top-k routing function
 
         Args:
@@ -653,8 +700,19 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
             )
 
+        import os as _os_pst
+        if _os_pst.environ.get("NRL_PAD_STATE_TRACE", "0") == "1":
+            _c = getattr(TopKRouter, "_nrl_pst_calls", 0)
+            TopKRouter._nrl_pst_calls = _c + 1
+            if _c % 20000 == 0:
+                print(f"[NRL_PAD_STATE] call={_c} pad_to_cap={self.config.moe_pad_expert_input_to_capacity} "
+                      f"cap_factor={self.config.moe_expert_capacity_factor} "
+                      f"cg_pad_flag={getattr(self.config, 'moe_pad_experts_for_cuda_graph_inference', None)}",
+                      flush=True)
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
+            if _os_pst.environ.get("NRL_PAD_STATE_TRACE", "0") == "1":
+                print(f"[NRL_PAD_STATE] !!! apply_router_token_dropping ACTIVE (cap_factor={self.config.moe_expert_capacity_factor})", flush=True)
             probs, routing_map = apply_router_token_dropping(
                 probs,
                 routing_map,
@@ -747,6 +805,22 @@ class TopKRouter(Router):
         return super()._save_to_state_dict(*args, **kwargs)
 
 
+# PATCH(det route-replay-into-scoring, probe v7): minimal stand-in for RouterReplay
+# carrying EXACT-shape target indices, used to recompute routing probs for replayed
+# rows through the stock topk_routing_with_score_function replay-gather semantics
+# (probs = score-function over the gathered target-index scores). Deliberately NOT a
+# RouterReplay subclass: RouterReplay.__init__ appends to the global instance list.
+class _NRLExactReplayShim:
+    def __init__(self, target: torch.Tensor):
+        self._target = target
+
+    def get_replay_topk(
+        self, scores, topk, num_groups=None, group_topk=None, default_compute_topk=None
+    ):
+        idx = self._target.to(scores.device)
+        return scores.gather(1, idx), idx
+
+
 class InferenceTopKRouter(TopKRouter):
     """Inference-only top-k router that strips out training-specific overhead.
 
@@ -814,8 +888,38 @@ class InferenceTopKRouter(TopKRouter):
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
+        # PATCH(NRL_LOGIT_DUMP): per-layer router-logit dump for first-divergence
+        # localization (decode step vs prefill re-score). Eager-only (skipped during
+        # capture); rank 0; periodic rewrite so SIGTERM cannot lose the buffer.
+        _dump_dir = _os_ld.environ.get("NRL_LOGIT_DUMP", "")
+        if _dump_dir and not torch.cuda.is_current_stream_capturing():
+            _r = _os_ld.environ.get("RANK", "0")
+            if _r == "0":
+                _st = _NRL_LD_STATE
+                if not _st["banner"]:
+                    _st["banner"] = True
+                    print(f"[NRL_LOGIT_DUMP] ACTIVE -> {_dump_dir}", flush=True)
+                _st["buf"].append(
+                    (int(getattr(self, "layer_number", -1)),
+                     int(logits.shape[0]),
+                     logits[: min(logits.shape[0], 96)].detach().float().cpu().clone())
+                )
+                _st["n"] += 1
+                if _st["n"] % 48 == 0:
+                    torch.save(_st["buf"], _dump_dir + "/logits_rank0.pt")
 
-        probs, top_indices = self._compiled_topk_routing(
+        # PATCH(NRL_DET_INFOPT, D3): torch.compile'd (Inductor) softmax differs from
+        # eager softmax by 1 ulp fp32 on rare-value rows (repro 2314239: compiled
+        # reproduces engine bits, eager reproduces TE-scoring bits, all 14/14 pairs).
+        # Det mode calls the SAME function object eagerly — still CUDA-graph-capturable.
+        _nrl_routing_fn = self._compiled_topk_routing
+        if _os_ld.environ.get("NRL_DET_INFOPT", "0") == "1":
+            _nrl_routing_fn = topk_routing_with_score_function
+            if not globals().get("_NRL_DET_ROUTER_BANNER"):
+                globals()["_NRL_DET_ROUTER_BANNER"] = True
+                print("[NRL_DET_INFOPT] eager router prob path ACTIVE "
+                      "(topk_routing_with_score_function, no torch.compile)", flush=True)
+        probs, top_indices = _nrl_routing_fn(
             logits,
             self.topk,
             use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -828,6 +932,55 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=self.router_replay,
             dense_output=True,
         )
+
+        # PATCH(det route-replay-into-scoring, probe v7): partial replay of
+        # generation-time routes into an engine-side scoring prefill. Armed by the
+        # NRL_RPROBE worker probe by setting
+        # `router_replay.nrl_partial_target = [n_replay_rows, topk] (int64, cuda)`
+        # on this layer's RouterReplay instance; disarmed by setting it to None.
+        # Design constraints honored:
+        #  - Runs OUTSIDE the @torch.compile region and never toggles
+        #    router_replay_action, so the compiled RECORD-branch graph (and hence
+        #    all generation-time kernels/numerics) is untouched.
+        #  - Only engages when this call has EXACTLY n_replay_rows + 1 rows — the
+        #    scoring request's own solo prefill (T prompt tokens vs T-1 recorded
+        #    routes; the final input token has no recorded route and keeps its
+        #    freshly computed top-k). EP-lockstep dummy steps (1-2 rows), decode
+        #    steps, and any co-batched/live-generation prefill (different row
+        #    count) all fall through untouched, so a stale/overlapping arm can
+        #    never corrupt real generation traffic.
+        #  - Rows whose fresh top-k already equals the target keep the compiled
+        #    probs bitwise; only genuinely flipped rows get probs recomputed
+        #    eagerly (exact REPLAY_FORWARD gather semantics via the shim).
+        #  - recorded_topk_idx is overwritten with the merged indices so the
+        #    engine's per-block routing harvest returns the replayed routes
+        #    (shape stays [num_tokens, topk] -> downstream asserts hold) and the
+        #    probe can verify engagement from the returned routing_indices.
+        _rr = self.router_replay
+        _tgt = getattr(_rr, "nrl_partial_target", None) if _rr is not None else None
+        if _tgt is not None and top_indices.shape[0] == _tgt.shape[0] + 1:
+            n_replay = _tgt.shape[0]
+            merged = top_indices.clone()
+            merged[:n_replay] = _tgt.to(device=top_indices.device, dtype=top_indices.dtype)
+            row_diff = (merged != top_indices).any(dim=-1)
+            if bool(row_diff.any()):
+                probs_replay, _ = topk_routing_with_score_function(
+                    logits,
+                    self.topk,
+                    use_pre_softmax=self.config.moe_router_pre_softmax,
+                    num_groups=self.config.moe_router_num_groups,
+                    group_topk=self.config.moe_router_group_topk,
+                    scaling_factor=self.config.moe_router_topk_scaling_factor,
+                    score_function=self.score_function,
+                    expert_bias=self.expert_bias,
+                    fused=False,  # fused path bypasses replay; force the eager branch
+                    router_replay=_NRLExactReplayShim(merged),
+                    dense_output=True,
+                )
+                probs = torch.where(row_diff.unsqueeze(-1), probs_replay, probs)
+            top_indices = merged
+            _rr.record_indices(merged)
+
         return probs.squeeze(1), top_indices.squeeze(1)
 
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):

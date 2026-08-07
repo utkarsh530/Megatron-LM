@@ -99,6 +99,76 @@ except ImportError:
 
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
+# PATCH(NRL_ATTNDUMP): capture attention-kernel immediate inputs (q post-qknorm+rope,
+# paged K/V pool head, seqlen metadata) for the first prefill-like FA4 calls.
+import os as _os_ad
+def _nrl_attn_dump(tag, q, k, v, cu_q, seqused, btab):
+    import torch as _t_ad
+    # PATCH(NRL_KRING): capture-safe ring of the CURRENT K-cache row (request 0's
+    # page, position seqused-1) — records through graph replay; lag-96 gate freezes
+    # idle dummy repetition. Offline: compare appended K vs B's per-position k.
+    _kr = _os_ad.environ.get("NRL_KRING", "")
+    if _kr and _os_ad.environ.get("RANK", "0") == "0" and btab is not None and k.dim() == 4:
+        _g = globals()
+        if "_NRL_KR_BUF" not in _g:
+            _g["_NRL_KR_BUF"] = _t_ad.zeros(8192, 512, dtype=_t_ad.float32, device=k.device)
+            _g["_NRL_KR_CNT"] = _t_ad.zeros(1, dtype=_t_ad.int64, device=k.device)
+            import threading as _th, time as _tm, os as _os_kr
+            def _kr_loop():
+                while True:
+                    _tm.sleep(5)
+                    try:
+                        _tmp = _kr + "/kring_A.pt.tmp"
+                        _t_ad.save({"buf": _g["_NRL_KR_BUF"].cpu(),
+                                    "cnt": int(_g["_NRL_KR_CNT"].item())}, _tmp)
+                        _os_kr.replace(_tmp, _kr + "/kring_A.pt")
+                    except Exception:
+                        pass
+            _th.Thread(target=_kr_loop, daemon=True).start()
+        _pg = btab[0, 0].to(_t_ad.int64)
+        _pos = (seqused[0].to(_t_ad.int64) - 1).clamp(min=0)
+        _row = k.reshape(-1, k.shape[-2] * k.shape[-1]).index_select(0, (_pg * k.shape[1] + _pos).reshape(1)).float()
+        _row = _row[:, :512]
+        _cnt = _g["_NRL_KR_CNT"]
+        _gk = _t_ad.ones(1, dtype=_t_ad.int64, device=k.device)
+        for _lag in (48, 96, 192):
+            _ref = _g["_NRL_KR_BUF"].index_select(0, (_cnt - _lag) % 8192)
+            _gk = _gk * (_row[0] != _ref[0]).any().to(_t_ad.int64).reshape(1)
+        _g["_NRL_KR_BUF"].index_copy_(0, _cnt % 8192, _row)
+        _cnt.add_(_gk)
+    _dd = _os_ad.environ.get("NRL_OPDUMP", "")
+    if not _dd or _os_ad.environ.get("RANK", "0") != "0":
+        return
+    if _t_ad.cuda.is_current_stream_capturing():
+        return
+    _st = globals().setdefault("_NRL_AD_ST", {"n": 0})
+    if _st["n"] >= 6:
+        return
+    qq = q.reshape(-1, q.shape[-2], q.shape[-1])
+    if qq.shape[0] < 25 or bool(_t_ad.isnan(qq[:16].float()).any()):
+        return
+    if bool((qq[0] == qq[1]).all()):
+        return
+    payload = {"tag": tag,
+               "q": qq[:32].detach().float().cpu().clone(),
+               "cu_q": None if cu_q is None else cu_q.detach().cpu().clone(),
+               "seqused": None if seqused is None else seqused.detach().cpu().clone(),
+               "btab0": None if btab is None else btab[:1].detach().cpu().clone()}
+    try:
+        # follow the block table: dump the REQUEST'S page, not the pool head
+        _pg = int(btab[0, 0]) if btab is not None else 0
+        kk = k.reshape(-1, k.shape[-2], k.shape[-1])
+        _psz = kk.shape[0] // max(1, k.shape[0]) if k.dim() == 4 else 64
+        _psz = k.shape[1] if k.dim() == 4 else 64
+        payload["kpage"] = k[_pg][:_psz].detach().float().cpu().clone() if k.dim() == 4 else kk[_pg*64:(_pg+1)*64].detach().float().cpu().clone()
+        payload["vpage"] = v[_pg][:_psz].detach().float().cpu().clone() if v.dim() == 4 else v.reshape(-1, v.shape[-2], v.shape[-1])[_pg*64:(_pg+1)*64].detach().float().cpu().clone()
+        payload["pg"] = _pg
+    except Exception as _e:
+        payload["kerr"] = repr(_e)
+    _t_ad.save(payload, _dd + f"/attnin_A_{_st['n']}.pt")
+    _st["n"] += 1
+
+
 try:
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 except:
@@ -873,6 +943,7 @@ class Attention(MegatronModule, ABC):
             else:
                 softmax_scale = q.shape[-1] ** -0.5
             if HAVE_FA4:
+                _nrl_attn_dump("site876", q, k, v, cu_seqlens_q, seqlens_k, block_table)
                 output_total, _ = flash_attn4_varlen_func(
                     q,
                     k,
@@ -963,6 +1034,7 @@ class Attention(MegatronModule, ABC):
                         softmax_scale = q.shape[-1] ** -0.5
                     # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
                     q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
+                    _nrl_attn_dump("site966", q_varlen, k, v, cu_seqlens_q, seqlens_k, block_table)
                     output_total, _ = flash_attn4_varlen_func(
                         q_varlen,
                         k,
